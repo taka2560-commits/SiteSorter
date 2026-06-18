@@ -6,6 +6,7 @@ multi/zip など要確認の判定は resolver コールバックで解決（無
 """
 import os
 import shutil
+import time
 from datetime import datetime
 
 import sys
@@ -86,9 +87,62 @@ def unique_path(dst: str) -> str:
     return cand
 
 
-def _chunk_copy(src: str, dst: str, progress_cb=None) -> None:
-    """チャンクコピー（.part→検証→確定。中断時に不完全ファイルを残さない）"""
-    total = os.path.getsize(src)
+def _is_writing(path: str, interval: float = 0.5) -> bool:
+    """ファイルが書き込み中かどうかを検出（サイズ/更新日時の変化で判定）"""
+    try:
+        st1 = os.stat(path)
+        time.sleep(interval)
+        st2 = os.stat(path)
+        return (st1.st_size != st2.st_size
+                or st1.st_mtime_ns != st2.st_mtime_ns)
+    except OSError:
+        return True
+
+
+def _filter_writing(files, log_cb=None, skipped=None):
+    """書き込み中（コピー途中等）のファイルを除外するバッチチェック。
+
+    全ファイルのstat -> 0.5秒待機 -> 再stat で、サイズ/更新日時が変化した
+    ファイルを書き込み中とみなしスキップする。1回の待機で全ファイルを判定。
+    """
+    if not files:
+        return files
+    snap = {}
+    for f in files:
+        try:
+            st = os.stat(f)
+            snap[f] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            snap[f] = None
+    time.sleep(0.5)
+    stable = []
+    for f in files:
+        prev = snap.get(f)
+        try:
+            st = os.stat(f)
+            cur = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            cur = None
+        if prev is None or cur is None or prev != cur:
+            name = os.path.basename(f)
+            if log_cb:
+                log_cb("[スキップ] %s: 書き込み中（コピー未完了の可能性）" % name)
+            if skipped is not None:
+                skipped.append({"path": f, "toggle": None,
+                                "reason": "書き込み中"})
+        else:
+            stable.append(f)
+    return stable
+
+
+def _chunk_copy(src, dst, progress_cb=None):
+    """チャンクコピー（.part -> 検証 -> 確定。中断時に不完全ファイルを残さない）
+
+    コピー前後でソースのstat（サイズ・更新日時）を比較し、
+    コピー中にファイルが変更された場合はIOErrorで中断する。
+    """
+    stat_before = os.stat(src)
+    total = stat_before.st_size
     tmp = dst + ".part"
     copied = 0
     try:
@@ -102,7 +156,14 @@ def _chunk_copy(src: str, dst: str, progress_cb=None) -> None:
                 if progress_cb:
                     progress_cb(copied, total)
         if os.path.getsize(tmp) != total:
-            raise IOError(f"コピー検証に失敗: {src}")
+            raise IOError("コピー検証に失敗（サイズ不一致）: %s" % src)
+        # コピー中にソースが変更されていないことを確認
+        stat_after = os.stat(src)
+        if (stat_before.st_size != stat_after.st_size
+                or stat_before.st_mtime_ns != stat_after.st_mtime_ns):
+            raise IOError(
+                "コピー中にファイルが変更されました（書き込み中の可能性）: %s"
+                % os.path.basename(src))
         shutil.copystat(src, tmp)
         os.replace(tmp, dst)
     except BaseException:
@@ -111,7 +172,7 @@ def _chunk_copy(src: str, dst: str, progress_cb=None) -> None:
         raise
 
 
-def copy_file(src: str, dst: str, progress_cb=None) -> str:
+def copy_file(src, dst, progress_cb=None):
     """コピー（元を残す）。同名衝突は自動リネーム。"""
     dst = unique_path(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -119,7 +180,7 @@ def copy_file(src: str, dst: str, progress_cb=None) -> str:
     return dst
 
 
-def move_file(src: str, dst: str, progress_cb=None) -> str:
+def move_file(src, dst, progress_cb=None):
     """移動。同一ドライブはrename、異ドライブはチャンクコピー＋元削除。"""
     dst = unique_path(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -136,7 +197,7 @@ def move_file(src: str, dst: str, progress_cb=None) -> str:
     return dst
 
 
-def move_dir(src: str, dst_dir: str) -> str:
+def move_dir(src, dst_dir):
     """フォルダを丸ごと移動（衝突時はフォルダ名にタイムスタンプ付与）"""
     dst = unique_path(os.path.join(dst_dir, os.path.basename(src)))
     os.makedirs(dst_dir, exist_ok=True)
@@ -144,17 +205,17 @@ def move_dir(src: str, dst_dir: str) -> str:
     return dst
 
 
-def _dest_for(base: str, src: str, folder: str, photo: str) -> str:
+def _dest_for(base, src, folder, photo):
     """フォルダ判定結果から最終パスを組み立て（受領=日付/写真=撮影日）"""
     name = os.path.basename(src)
     if folder == rules.RECEIVE_DIR:
-        return os.path.join(base, folder, f"{_today()}_受領", name)
+        return os.path.join(base, folder, "%s_受領" % _today(), name)
     if photo and folder == photo:
         return os.path.join(base, folder, get_photo_date(src), name)
     return os.path.join(base, folder, name)
 
 
-def _resolve(src: str, resolver, log_cb) -> str:
+def _resolve(src, resolver, log_cb):
     """classify結果のmulti/zipをresolverで解決。未解決はNone（スキップ）。"""
     name = os.path.basename(src)
     c = rules.classify(name)
@@ -163,16 +224,16 @@ def _resolve(src: str, resolver, log_cb) -> str:
     if "multi" in c:
         folder = resolver("multi", name, c["multi"]) if resolver else None
         if not folder and log_cb:
-            log_cb(f"[要確認] {name}: 複数カテゴリ該当 → {' / '.join(c['multi'])}（スキップ）")
+            log_cb("[要確認] %s: 複数カテゴリ該当 → %s（スキップ）" % (name, " / ".join(c["multi"])))
         return folder
     # zip（トグルなし）
     folder = resolver("zip", name, None) if resolver else None
     if not folder and log_cb:
-        log_cb(f"[要確認] {name}: .zipの移動先が未確定（スキップ）")
+        log_cb("[要確認] %s: .zipの移動先が未確定（スキップ）" % name)
     return folder
 
 
-def preflight(base: str) -> list:
+def preflight(base):
     """Inbox一括処理の事前スキャン。要確認項目 [(名前, 種別, 候補), ...] を返す。
 
     種別: "multi"（複数カテゴリ該当・候補リスト付き） / "zip"（移動先未確定）
@@ -190,13 +251,15 @@ def preflight(base: str) -> list:
     return pend
 
 
-def organize(base: str, progress_cb=None, log_cb=None, resolver=None,
-             skipped=None) -> list:
+def organize(base, progress_cb=None, log_cb=None, resolver=None,
+             skipped=None):
     """00_Inbox の一括仕分け。戻り値: 操作リスト（Undo用）"""
     ensure_structure(base)
     batch = _now()
     photo = rules.photo_dir()
     files = scan_inbox(base)
+    # 書き込み中（Explorerでコピー途中等）のファイルを事前に除外
+    files = _filter_writing(files, log_cb, skipped)
     total_bytes = sum(os.path.getsize(f) for f in files) or 1
     done = 0
     ops = []
@@ -208,7 +271,7 @@ def organize(base: str, progress_cb=None, log_cb=None, resolver=None,
                 continue  # ロック・一時ファイルは触らない
             if is_locked(src):
                 if log_cb:
-                    log_cb(f"[スキップ] {name}: 使用中（ロック検知）")
+                    log_cb("[スキップ] %s: 使用中（ロック検知）" % name)
                 if skipped is not None:
                     skipped.append({"path": src, "toggle": None,
                                     "reason": "ロック中"})
@@ -225,10 +288,10 @@ def organize(base: str, progress_cb=None, log_cb=None, resolver=None,
             ops.append({"op": "move", "src": src, "dst": actual,
                         "time": _now(), "batch": batch})
             if log_cb:
-                log_cb(f"{name} → {os.path.relpath(actual, base)}")
+                log_cb("%s → %s" % (name, os.path.relpath(actual, base)))
         except (OSError, IOError) as e:
             if log_cb:
-                log_cb(f"[スキップ] {name}: {e}")
+                log_cb("[スキップ] %s: %s" % (name, e))
         finally:
             done += size
             if progress_cb:
@@ -236,9 +299,9 @@ def organize(base: str, progress_cb=None, log_cb=None, resolver=None,
     return ops
 
 
-def ingest_drop(base: str, paths: list, toggle=None,
+def ingest_drop(base, paths, toggle=None,
                 progress_cb=None, log_cb=None, resolver=None,
-                skipped=None) -> list:
+                skipped=None):
     """ドロップ経路の即時仕分け。
 
     toggle: None / "submit"（提出） / "receive"（受領）
@@ -258,30 +321,31 @@ def ingest_drop(base: str, paths: list, toggle=None,
                 continue
             if is_transient(name):
                 if log_cb:
-                    log_cb(f"[スキップ] {name}: 一時/ロックファイル")
+                    log_cb("[スキップ] %s: 一時/ロックファイル" % name)
                 continue
-            if is_locked(src):
+            if is_locked(src) or _is_writing(src):
+                reason = "使用中" if is_locked(src) else "書き込み中"
                 if log_cb:
-                    log_cb(f"[スキップ] {name}: 使用中（ロック検知）")
+                    log_cb("[スキップ] %s: %s" % (name, reason))
                 if skipped is not None:
                     skipped.append({"path": src, "toggle": toggle,
-                                    "reason": "ロック中"})
+                                    "reason": reason})
                 continue
             if toggle == "receive":
-                dst = os.path.join(base, rules.RECEIVE_DIR, f"{_today()}_受領", name)
+                dst = os.path.join(base, rules.RECEIVE_DIR, "%s_受領" % _today(), name)
                 actual = move_file(src, dst, progress_cb and (lambda c, t: progress_cb(c, t, name)))
                 ops.append({"op": "move", "src": src, "dst": actual,
                             "time": _now(), "batch": batch})
                 if log_cb:
-                    log_cb(f"[受領] {name} → {os.path.relpath(actual, base)}")
+                    log_cb("[受領] %s → %s" % (name, os.path.relpath(actual, base)))
             elif toggle == "submit":
-                sub = os.path.join(base, rules.SUBMIT_DIR, f"{_today()}_提出", name)
+                sub = os.path.join(base, rules.SUBMIT_DIR, "%s_提出" % _today(), name)
                 if name.lower().endswith(".zip"):
                     actual = copy_file(src, sub)
                     ops.append({"op": "copy", "src": src, "dst": actual,
                                 "time": _now(), "batch": batch})
                     if log_cb:
-                        log_cb(f"[提出/zip] {name} → {os.path.relpath(actual, base)}")
+                        log_cb("[提出/zip] %s → %s" % (name, os.path.relpath(actual, base)))
                 else:
                     work = os.path.join(base, rules.WORK_DIR, name)
                     a1 = copy_file(src, work)
@@ -289,8 +353,8 @@ def ingest_drop(base: str, paths: list, toggle=None,
                     ops.append({"op": "copy_dual", "src": src, "dst": a1,
                                 "dst2": a2, "time": _now(), "batch": batch})
                     if log_cb:
-                        log_cb(f"[提出] {name} → 10_図面_作業用 と "
-                               f"{os.path.relpath(a2, base)} に同時コピー")
+                        log_cb("[提出] %s → 10_図面_作業用 と %s に同時コピー"
+                               % (name, os.path.relpath(a2, base)))
             else:
                 folder = _resolve(src, resolver, None)
                 if not folder:
@@ -300,21 +364,21 @@ def ingest_drop(base: str, paths: list, toggle=None,
                     ops.append({"op": "move", "src": src, "dst": actual,
                                 "time": _now(), "batch": batch})
                     if log_cb:
-                        log_cb(f"[要確認] {name}: 移動先未確定のためInboxへ仮置き")
+                        log_cb("[要確認] %s: 移動先未確定のためInboxへ仮置き" % name)
                 else:
                     dst = _dest_for(base, src, folder, photo)
                     actual = move_file(src, dst, progress_cb and (lambda c, t: progress_cb(c, t, name)))
                     ops.append({"op": "move", "src": src, "dst": actual,
                                 "time": _now(), "batch": batch})
                     if log_cb:
-                        log_cb(f"{name} → {os.path.relpath(actual, base)}")
+                        log_cb("%s → %s" % (name, os.path.relpath(actual, base)))
         except (OSError, IOError) as e:
             if log_cb:
-                log_cb(f"[スキップ] {name}: {e}")
+                log_cb("[スキップ] %s: %s" % (name, e))
     return ops
 
 
-def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo) -> list:
+def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
     """フォルダ投入時の処理"""
     name = os.path.basename(src)
     ops = []
@@ -324,17 +388,17 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo) -> list:
         ops.append({"op": "move", "src": src, "dst": actual,
                     "time": _now(), "batch": batch})
         if log_cb:
-            log_cb(f"[受領] フォルダ {name} → 12_社外受領データ（丸ごと）")
+            log_cb("[受領] フォルダ %s → 12_社外受領データ（丸ごと）" % name)
         return ops
     if toggle == "submit":
         if log_cb:
-            log_cb(f"[スキップ] フォルダ {name}: 提出トグルはファイルのみ対象")
+            log_cb("[スキップ] フォルダ %s: 提出トグルはファイルのみ対象" % name)
         return ops
     # 通常: resolver("folder")で expand / keep を選択。既定=keep（Inboxへ維持移動）
     choice = resolver("folder", name, None) if resolver else "keep"
     if choice is None:  # キャンセル → 元の場所に残す
         if log_cb:
-            log_cb(f"[キャンセル] フォルダ {name}: 処理を中止（元の場所に残します）")
+            log_cb("[キャンセル] フォルダ %s: 処理を中止（元の場所に残します）" % name)
         return ops
     if choice == "expand":
         for item in sorted(os.listdir(src)):  # 直下1階層のみ
@@ -354,7 +418,7 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo) -> list:
                 ops.append({"op": "move", "src": p, "dst": actual,
                             "time": _now(), "batch": batch})
                 if log_cb:
-                    log_cb(f"{item} → {os.path.relpath(actual, base)}")
+                    log_cb("%s → %s" % (item, os.path.relpath(actual, base)))
         try:
             os.rmdir(src)  # 空になったら削除
         except OSError:
@@ -364,32 +428,32 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo) -> list:
         ops.append({"op": "move", "src": src, "dst": actual,
                     "time": _now(), "batch": batch})
         if log_cb:
-            log_cb(f"フォルダ {name} → 00_Inbox（維持移動）")
+            log_cb("フォルダ %s → 00_Inbox（維持移動）" % name)
     return ops
 
 
-def create_site(parent_dir: str, name: str, templates=None, log_cb=None) -> str:
+def create_site(parent_dir, name, templates=None, log_cb=None):
     """新規現場のテンプレート一発作成（フォルダ構造＋雛形ファイル配置）"""
     base = os.path.join(parent_dir, name)
     if os.path.exists(base):
-        raise ValueError(f"既に存在します: {base}")
+        raise ValueError("既に存在します: %s" % base)
     ensure_structure(base)
     for t in templates or []:
         src = t.get("src", "")
         dst_rel = t.get("dst", "") or ""
         if not src or not os.path.isfile(src):
             if log_cb:
-                log_cb(f"[雛形スキップ] 見つかりません: {src}")
+                log_cb("[雛形スキップ] 見つかりません: %s" % src)
             continue
         dst_dir = os.path.join(base, dst_rel)
         os.makedirs(dst_dir, exist_ok=True)
         shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
         if log_cb:
-            log_cb(f"[雛形配置] {os.path.basename(src)} → {dst_rel or '（直下）'}")
+            log_cb("[雛形配置] %s → %s" % (os.path.basename(src), dst_rel or "（直下）"))
     return base
 
 
-def archive_files(base: str, paths: list, log_cb=None) -> list:
+def archive_files(base, paths, log_cb=None):
     """承認済みの旧版ファイルを 99_Archive へ移動（Undo可能な操作リストを返す）"""
     batch = _now()
     ops = []
@@ -402,14 +466,14 @@ def archive_files(base: str, paths: list, log_cb=None) -> list:
             ops.append({"op": "move", "src": src, "dst": dst,
                         "time": _now(), "batch": batch})
             if log_cb:
-                log_cb(f"[旧版] {os.path.basename(src)} → {rules.ARCHIVE}")
+                log_cb("[旧版] %s → %s" % (os.path.basename(src), rules.ARCHIVE))
         except (OSError, IOError) as e:
             if log_cb:
-                log_cb(f"[失敗] {os.path.basename(src)}: {e}")
+                log_cb("[失敗] %s: %s" % (os.path.basename(src), e))
     return ops
 
 
-def send_to_inbox(base: str, paths: list, log_cb=None) -> list:
+def send_to_inbox(base, paths, log_cb=None):
     """仮置き: ファイル/フォルダを 00_Inbox へ移動（仕分けしない）"""
     ensure_structure(base)
     inbox = os.path.join(base, rules.INBOX)
@@ -423,8 +487,8 @@ def send_to_inbox(base: str, paths: list, log_cb=None) -> list:
             else:
                 continue
             if log_cb:
-                log_cb(f"Inboxへ仮置き: {os.path.basename(src)}")
+                log_cb("Inboxへ仮置き: %s" % os.path.basename(src))
         except (OSError, IOError) as e:
             if log_cb:
-                log_cb(f"[転送失敗] {os.path.basename(src)}: {e}")
+                log_cb("[転送失敗] %s: %s" % (os.path.basename(src), e))
     return moved
