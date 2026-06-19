@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self.cap_worker = None
         self.zone = None
         self.retry_items = []
+        self._archive_checked_paths: set = set()
         self.setWindowTitle("SiteSorter - 現場フォルダ自動整理")
         self.resize(860, 640)
         self.setMinimumSize(760, 560)
@@ -477,9 +478,11 @@ class MainWindow(QMainWindow):
         base = self.settings.get("site_folder")
         if not base or not os.path.isdir(base):
             return
-        dlg = ArchiveDialog(self, base)
+        dlg = ArchiveDialog(self, base, preselected=self._archive_checked_paths)
         if not dlg.exec():
+            self._archive_checked_paths = set(dlg.selected())
             return
+        self._archive_checked_paths = set()
         sel = dlg.selected()
         if not sel:
             return
@@ -611,6 +614,17 @@ class MainWindow(QMainWindow):
         base = self.settings.get("site_folder")
         if not base or not os.path.isdir(base):
             QMessageBox.warning(self, "SiteSorter", "現場フォルダを指定してください。")
+            return
+        files = scan_inbox(base)
+        if not files:
+            self.log("00_Inbox にファイルがありません。")
+            return
+        reply = QMessageBox.question(
+            self, "一括仕分けの確認",
+            f"00_Inbox 内の {len(files)} 件のファイルを仕分けします。\nよろしいですか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
             return
         # 要確認項目（複数マッチ・zip）をメインスレッドで先に解決
         decisions = dialogs.confirm_inbox_pending(self, preflight(base))

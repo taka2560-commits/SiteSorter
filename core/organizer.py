@@ -18,6 +18,14 @@ CHUNK_SIZE = 4 * 1024 * 1024
 TRANSIENT_EXTS = {".dwl", ".dwl2", ".part", ".tmp", ".crdownload", ".bak~"}
 
 
+def _safe_path(base: str, candidate: str) -> None:
+    """candidate が base 配下に収まることを確認（パストラバーサル防止）"""
+    norm_base = os.path.normcase(os.path.abspath(base))
+    norm_cand = os.path.normcase(os.path.abspath(candidate))
+    if not (norm_cand == norm_base or norm_cand.startswith(norm_base + os.sep)):
+        raise OSError("安全でないパスを検知しました（操作を中止）: %s" % candidate)
+
+
 def is_transient(name: str) -> bool:
     return (os.path.splitext(name)[1].lower() in TRANSIENT_EXTS
             or name.startswith("~$") or name == "desktop.ini")
@@ -61,7 +69,7 @@ def is_locked(path: str) -> bool:
     return False
 
 
-def get_photo_date(path: str) -> str:
+def get_photo_date(path: str, log_cb=None) -> str:
     try:
         from PIL import Image
         with Image.open(path) as img:
@@ -71,6 +79,8 @@ def get_photo_date(path: str) -> str:
                 return datetime.strptime(str(raw)[:10], "%Y:%m:%d").strftime("%Y-%m-%d")
     except Exception:
         pass
+    if log_cb:
+        log_cb("[情報] %s: EXIF日付なし → ファイル更新日時を使用" % os.path.basename(path))
     return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
 
 
@@ -205,14 +215,17 @@ def move_dir(src, dst_dir):
     return dst
 
 
-def _dest_for(base, src, folder, photo):
+def _dest_for(base, src, folder, photo, log_cb=None):
     """フォルダ判定結果から最終パスを組み立て（受領=日付/写真=撮影日）"""
     name = os.path.basename(src)
     if folder == rules.RECEIVE_DIR:
-        return os.path.join(base, folder, "%s_受領" % _today(), name)
-    if photo and folder == photo:
-        return os.path.join(base, folder, get_photo_date(src), name)
-    return os.path.join(base, folder, name)
+        dst = os.path.join(base, folder, "%s_受領" % _today(), name)
+    elif photo and folder == photo:
+        dst = os.path.join(base, folder, get_photo_date(src, log_cb), name)
+    else:
+        dst = os.path.join(base, folder, name)
+    _safe_path(base, dst)
+    return dst
 
 
 def _resolve(src, resolver, log_cb):
@@ -269,6 +282,10 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
         try:
             if is_transient(name):
                 continue  # ロック・一時ファイルは触らない
+            if os.path.islink(src):
+                if log_cb:
+                    log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
+                continue
             if is_locked(src):
                 if log_cb:
                     log_cb("[スキップ] %s: 使用中（ロック検知）" % name)
@@ -279,7 +296,7 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
             folder = _resolve(src, resolver, log_cb)
             if not folder:
                 continue
-            dst = _dest_for(base, src, folder, photo)
+            dst = _dest_for(base, src, folder, photo, log_cb)
 
             def cb(c, _t, _b=done):
                 if progress_cb:
@@ -314,6 +331,10 @@ def ingest_drop(base, paths, toggle=None,
     for src in paths:
         name = os.path.basename(src)
         try:
+            if os.path.islink(src):
+                if log_cb:
+                    log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
+                continue
             if os.path.isdir(src):
                 ops += _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo)
                 continue
@@ -366,7 +387,7 @@ def ingest_drop(base, paths, toggle=None,
                     if log_cb:
                         log_cb("[要確認] %s: 移動先未確定のためInboxへ仮置き" % name)
                 else:
-                    dst = _dest_for(base, src, folder, photo)
+                    dst = _dest_for(base, src, folder, photo, log_cb)
                     actual = move_file(src, dst, progress_cb and (lambda c, t: progress_cb(c, t, name)))
                     ops.append({"op": "move", "src": src, "dst": actual,
                                 "time": _now(), "batch": batch})
@@ -411,7 +432,7 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
                 folder = _resolve(p, resolver, log_cb)
                 if not folder:
                     folder = rules.INBOX
-                dst = (_dest_for(base, p, folder, photo)
+                dst = (_dest_for(base, p, folder, photo, log_cb)
                        if folder != rules.INBOX
                        else os.path.join(base, rules.INBOX, item))
                 actual = move_file(p, dst)

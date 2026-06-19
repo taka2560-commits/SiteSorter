@@ -8,6 +8,8 @@ from config import RULES_PATH as _CONFIG_RULES_PATH
 
 RULES_PATH = _CONFIG_RULES_PATH  # %APPDATA%\SiteSorter\rules.json
 
+_MAX_JSON_SIZE = 10 * 1024 * 1024  # 10MB
+
 INBOX = "00_Inbox"
 WORK_DIR = "10_図面_作業用"
 SUBMIT_DIR = "11_図面_提出済"      # 聖域（提出トグル専用）
@@ -112,6 +114,13 @@ def _save_raw(data: dict) -> None:
 
 def load_rules() -> None:
     try:
+        try:
+            fsize = os.path.getsize(RULES_PATH)
+        except FileNotFoundError:
+            _apply(json.loads(json.dumps(DEFAULT)))
+            return
+        if fsize > _MAX_JSON_SIZE:
+            raise OSError("rules.json が大きすぎます（%d bytes）" % fsize)
         with open(RULES_PATH, encoding="utf-8") as f:
             data = json.load(f)
         if "folders" not in data:  # v1形式 → 自動移行

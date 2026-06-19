@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import warnings
 
 APP_DIR = os.path.dirname(os.path.abspath(
     sys.executable if getattr(sys, "frozen", False) else __file__))
@@ -32,6 +33,8 @@ for _name in ("settings.json", "history.json", "rules.json"):
         except OSError:
             pass
 
+_MAX_JSON_SIZE = 10 * 1024 * 1024  # 10MB
+
 DEFAULTS = {
     "theme": "earth",            # "earth" | "night"
     "site_folder": "",           # 現在の現場フォルダ
@@ -46,10 +49,27 @@ DEFAULTS = {
 
 def load_settings() -> dict:
     try:
+        size = os.path.getsize(SETTINGS_PATH)
+    except FileNotFoundError:
+        return dict(DEFAULTS)
+    except OSError:
+        return dict(DEFAULTS)
+
+    if size > _MAX_JSON_SIZE:
+        warnings.warn("settings.json が大きすぎます。デフォルト設定で起動します。", UserWarning)
+        return dict(DEFAULTS)
+
+    try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except json.JSONDecodeError as e:
+        warnings.warn(
+            "settings.json が破損しています（デフォルト設定で起動）: %s" % e, UserWarning)
         data = {}
+    except OSError as e:
+        warnings.warn("settings.json の読み込みに失敗しました: %s" % e, UserWarning)
+        data = {}
+
     merged = dict(DEFAULTS)
     merged.update(data)
     return merged

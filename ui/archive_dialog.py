@@ -10,7 +10,7 @@ from core.versions import find_old_candidates
 
 
 class ArchiveDialog(QDialog):
-    def __init__(self, parent, base: str):
+    def __init__(self, parent, base: str, preselected: set = None):
         super().__init__(parent)
         self.base = base
         self.setWindowTitle("旧バージョンの検知")
@@ -28,7 +28,8 @@ class ArchiveDialog(QDialog):
         for c in self.cands:
             item = QListWidgetItem(f"{c['rel']}　← 最新: {c['keep']}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
+            pre = preselected and c["path"] in preselected
+            item.setCheckState(Qt.Checked if pre else Qt.Unchecked)
             item.setData(Qt.UserRole, c["path"])
             self.list.addItem(item)
         lay.addWidget(self.list, 1)
