@@ -25,9 +25,13 @@ class SortWorker(QThread):
             self.progress.emit(int(done * 100 / total), name)
 
         skipped = []
-        ops = organize(self.base, progress_cb=on_progress,
-                       log_cb=self.log.emit, resolver=self.resolver,
-                       skipped=skipped)
+        ops = []
+        try:
+            ops = organize(self.base, progress_cb=on_progress,
+                           log_cb=self.log.emit, resolver=self.resolver,
+                           skipped=skipped)
+        except Exception as e:  # 完了通知は必ず出す（UIが処理中のまま止まらないように）
+            self.log.emit("[エラー] 仕分けを中断しました: %s" % e)
         if skipped:
             self.skipped_found.emit(skipped)
         self.finished_batch.emit(ops)

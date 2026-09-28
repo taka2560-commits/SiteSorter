@@ -229,6 +229,70 @@ check("書き込み中はスキップ（toggle付きで収集）", len(sk_w) == 
 check("書き込み中のファイルは元の場所に残る", os.path.exists(growing))
 shutil.rmtree(base4); shutil.rmtree(desk4)
 
+print("[15] 一括仕分け中にInboxのファイルが消えても止まらない")
+base5 = tempfile.mkdtemp(prefix="v2g_")
+ensure_structure(base5)
+ib5 = os.path.join(base5, rules.INBOX)
+for n in ("a.dwg", "b.dwg", "c.dwg"):
+    put(ib5, n)
+def _vanish(done, total, name):
+    gone = os.path.join(ib5, "c.dwg")
+    if name == "a.dwg" and os.path.exists(gone):
+        os.remove(gone)  # 処理中にエクスプローラで削除された想定
+logs5 = []
+try:
+    ops_g = organize(base5, progress_cb=_vanish, log_cb=logs5.append)
+    raised = None
+except Exception as e:
+    ops_g, raised = [], e
+check("例外で止まらない", raised is None)
+check("移動済みの2件は操作リストに残る（Undo可能）", len(ops_g) == 2)
+check("消えたファイルは理由がログに出る",
+      any("c.dwg" in l and "見つかりません" in l for l in logs5))
+shutil.rmtree(base5)
+
+print("[16] フォルダの個別仕分けで1件失敗しても残りと履歴は失われない")
+import core.organizer as org
+base6 = tempfile.mkdtemp(prefix="v2h_")
+ensure_structure(base6)
+d6 = os.path.join(tempfile.mkdtemp(prefix="desk6_"), "展開失敗")
+for n in ("a.dwg", "b.dwg", "c.dwg"):
+    put(d6, n)
+_orig_move = org.move_file
+def _flaky_move(src, dst, progress_cb=None):
+    if os.path.basename(src) == "b.dwg":
+        raise OSError("テスト用の移動失敗")
+    return _orig_move(src, dst, progress_cb)
+org.move_file = _flaky_move
+logs6 = []
+try:
+    ops_h = ingest_drop(base6, [d6], log_cb=logs6.append,
+                        resolver=lambda k, n, c: "expand" if k == "folder" else None)
+finally:
+    org.move_file = _orig_move
+check("失敗した1件以外は仕分けされる",
+      os.path.exists(os.path.join(base6, rules.WORK_DIR, "a.dwg"))
+      and os.path.exists(os.path.join(base6, rules.WORK_DIR, "c.dwg")))
+check("移動済みの2件は操作リストに残る", len(ops_h) == 2)
+check("失敗した1件は元の場所に残り理由がログに出る",
+      os.path.exists(os.path.join(d6, "b.dwg"))
+      and any("b.dwg" in l and "テスト用の移動失敗" in l for l in logs6))
+shutil.rmtree(base6); shutil.rmtree(os.path.dirname(d6))
+
+print("[17] 仕分けワーカー: 途中で例外が出ても完了通知を出す")
+from PySide6.QtCore import QCoreApplication
+from core.worker import SortWorker
+qapp = QCoreApplication.instance() or QCoreApplication([])
+not_dir = put(tempfile.mkdtemp(prefix="v2x_"), "フォルダではない")
+got, wlogs = [], []
+wk = SortWorker(not_dir)  # 現場フォルダが壊れている想定（ensure_structureで失敗）
+wk.finished_batch.connect(got.append)
+wk.log.connect(wlogs.append)
+wk.run()  # スレッドを起こさず同期実行
+check("finished_batch が必ず出る", got == [[]])
+check("エラー内容がログに出る", any(l.startswith("[エラー]") for l in wlogs))
+shutil.rmtree(os.path.dirname(not_dir))
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")

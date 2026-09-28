@@ -145,6 +145,13 @@ def _filter_writing(files, log_cb=None, skipped=None):
     return stable
 
 
+def _size_or_zero(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _chunk_copy(src, dst, progress_cb=None):
     """チャンクコピー（.part -> 検証 -> 確定。中断時に不完全ファイルを残さない）
 
@@ -273,18 +280,24 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
     files = scan_inbox(base)
     # 書き込み中（Explorerでコピー途中等）のファイルを事前に除外
     files = _filter_writing(files, log_cb, skipped)
-    total_bytes = sum(os.path.getsize(f) for f in files) or 1
+    # 処理中にファイルが消えても止まらないよう、サイズは先に取得しておく
+    sizes = {f: _size_or_zero(f) for f in files}
+    total_bytes = sum(sizes.values()) or 1
     done = 0
     ops = []
     for src in files:
         name = os.path.basename(src)
-        size = os.path.getsize(src)
+        size = sizes[src]
         try:
             if is_transient(name):
                 continue  # ロック・一時ファイルは触らない
             if os.path.islink(src):
                 if log_cb:
                     log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
+                continue
+            if not os.path.isfile(src):
+                if log_cb:
+                    log_cb("[スキップ] %s: 見つかりません（移動・削除された可能性）" % name)
                 continue
             if is_locked(src):
                 if log_cb:
@@ -430,22 +443,27 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
     if choice == "expand":
         for item in sorted(os.listdir(src)):  # 直下1階層のみ
             p = os.path.join(src, item)
-            if os.path.isdir(p):
-                actual = move_dir(p, os.path.join(base, rules.INBOX))
-                ops.append({"op": "move", "src": p, "dst": actual,
-                            "time": _now(), "batch": batch})
-            else:
-                folder = _resolve(p, resolver, log_cb)
-                if not folder:
-                    folder = rules.INBOX
-                dst = (_dest_for(base, p, folder, photo, log_cb)
-                       if folder != rules.INBOX
-                       else os.path.join(base, rules.INBOX, item))
-                actual = move_file(p, dst)
-                ops.append({"op": "move", "src": p, "dst": actual,
-                            "time": _now(), "batch": batch})
+            # 1件の失敗で残りの処理と移動済み分の履歴を失わないよう個別に捕捉
+            try:
+                if os.path.isdir(p):
+                    actual = move_dir(p, os.path.join(base, rules.INBOX))
+                    ops.append({"op": "move", "src": p, "dst": actual,
+                                "time": _now(), "batch": batch})
+                else:
+                    folder = _resolve(p, resolver, log_cb)
+                    if not folder:
+                        folder = rules.INBOX
+                    dst = (_dest_for(base, p, folder, photo, log_cb)
+                           if folder != rules.INBOX
+                           else os.path.join(base, rules.INBOX, item))
+                    actual = move_file(p, dst)
+                    ops.append({"op": "move", "src": p, "dst": actual,
+                                "time": _now(), "batch": batch})
+                    if log_cb:
+                        log_cb("%s → %s" % (item, os.path.relpath(actual, base)))
+            except (OSError, IOError) as e:
                 if log_cb:
-                    log_cb("%s → %s" % (item, os.path.relpath(actual, base)))
+                    log_cb("[スキップ] %s: %s" % (item, e))
         try:
             os.rmdir(src)  # 空になったら削除
         except OSError:
