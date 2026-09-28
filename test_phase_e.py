@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 import os, shutil, sys, tempfile
+# 実環境の %APPDATA%\SiteSorter に触れないよう、設定の保存先を一時フォルダへ切り替える
+DATA_TMP = tempfile.mkdtemp(prefix="sitesorter_data_")
+os.environ["APPDATA"] = DATA_TMP  # Windows
+os.environ["HOME"] = DATA_TMP     # Linux（~/.config）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules
 from core.organizer import ensure_structure, ingest_drop, organize
@@ -38,5 +42,6 @@ import config
 p = config.resource_path("assets/app.ico")
 check("通常時はAPP_DIR基準", p.startswith(config.APP_DIR))
 shutil.rmtree(base); shutil.rmtree(desk)
+shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
 sys.exit(1 if ng else 0)

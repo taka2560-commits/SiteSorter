@@ -7,10 +7,20 @@ import sys
 import tempfile
 from datetime import datetime
 
+# 設定の保存先を一時フォルダへ切り替えてから本体を読み込む。
+# このテストは rules.json を書き換え・削除するため、実環境の
+# %APPDATA%\SiteSorter（ユーザーのルール）を壊さないよう隔離する。
+DATA_TMP = tempfile.mkdtemp(prefix="sitesorter_data_")
+os.environ["APPDATA"] = DATA_TMP  # Windows
+os.environ["HOME"] = DATA_TMP     # Linux（~/.config）
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules
 from core.organizer import ensure_structure, organize, ingest_drop, scan_inbox, send_to_inbox
 from core.history import History
+
+if not rules.RULES_PATH.startswith(DATA_TMP):
+    sys.exit("中止: rules.json の保存先が一時フォルダではありません: " + rules.RULES_PATH)
 
 ok = ng = 0
 def check(name, cond):
@@ -191,6 +201,99 @@ check("EXIFなしフォールバック", any(
     os.path.exists(os.path.join(base2, "30_現場写真", d, "スクショ.png")) for d in pdirs))
 shutil.rmtree(base2)
 
+print("[14] ドロップの書き込み中チェック（待機は1回だけ・判定は維持）")
+import threading
+import time
+base4 = tempfile.mkdtemp(prefix="v2w_")
+ensure_structure(base4)
+desk4 = tempfile.mkdtemp(prefix="desk4_")
+many = [put(desk4, "w%02d.dwg" % i) for i in range(6)]
+t0 = time.perf_counter()
+ops_w = ingest_drop(base4, many)
+check("6件でも待ちは1回分（2秒未満）", time.perf_counter() - t0 < 2.0 and len(ops_w) == 6)
+growing = put(desk4, "書込中.dwg")
+stop = threading.Event()
+def _writer():
+    with open(growing, "ab") as fw:
+        while not stop.is_set():
+            fw.write(b"x"); fw.flush(); time.sleep(0.02)
+th = threading.Thread(target=_writer); th.start()
+time.sleep(0.1)
+sk_w = []
+try:
+    ingest_drop(base4, [growing], toggle="receive", skipped=sk_w)
+finally:
+    stop.set(); th.join()
+check("書き込み中はスキップ（toggle付きで収集）", len(sk_w) == 1
+      and sk_w[0]["reason"] == "書き込み中" and sk_w[0]["toggle"] == "receive")
+check("書き込み中のファイルは元の場所に残る", os.path.exists(growing))
+shutil.rmtree(base4); shutil.rmtree(desk4)
+
+print("[15] 一括仕分け中にInboxのファイルが消えても止まらない")
+base5 = tempfile.mkdtemp(prefix="v2g_")
+ensure_structure(base5)
+ib5 = os.path.join(base5, rules.INBOX)
+for n in ("a.dwg", "b.dwg", "c.dwg"):
+    put(ib5, n)
+def _vanish(done, total, name):
+    gone = os.path.join(ib5, "c.dwg")
+    if name == "a.dwg" and os.path.exists(gone):
+        os.remove(gone)  # 処理中にエクスプローラで削除された想定
+logs5 = []
+try:
+    ops_g = organize(base5, progress_cb=_vanish, log_cb=logs5.append)
+    raised = None
+except Exception as e:
+    ops_g, raised = [], e
+check("例外で止まらない", raised is None)
+check("移動済みの2件は操作リストに残る（Undo可能）", len(ops_g) == 2)
+check("消えたファイルは理由がログに出る",
+      any("c.dwg" in l and "見つかりません" in l for l in logs5))
+shutil.rmtree(base5)
+
+print("[16] フォルダの個別仕分けで1件失敗しても残りと履歴は失われない")
+import core.organizer as org
+base6 = tempfile.mkdtemp(prefix="v2h_")
+ensure_structure(base6)
+d6 = os.path.join(tempfile.mkdtemp(prefix="desk6_"), "展開失敗")
+for n in ("a.dwg", "b.dwg", "c.dwg"):
+    put(d6, n)
+_orig_move = org.move_file
+def _flaky_move(src, dst, progress_cb=None):
+    if os.path.basename(src) == "b.dwg":
+        raise OSError("テスト用の移動失敗")
+    return _orig_move(src, dst, progress_cb)
+org.move_file = _flaky_move
+logs6 = []
+try:
+    ops_h = ingest_drop(base6, [d6], log_cb=logs6.append,
+                        resolver=lambda k, n, c: "expand" if k == "folder" else None)
+finally:
+    org.move_file = _orig_move
+check("失敗した1件以外は仕分けされる",
+      os.path.exists(os.path.join(base6, rules.WORK_DIR, "a.dwg"))
+      and os.path.exists(os.path.join(base6, rules.WORK_DIR, "c.dwg")))
+check("移動済みの2件は操作リストに残る", len(ops_h) == 2)
+check("失敗した1件は元の場所に残り理由がログに出る",
+      os.path.exists(os.path.join(d6, "b.dwg"))
+      and any("b.dwg" in l and "テスト用の移動失敗" in l for l in logs6))
+shutil.rmtree(base6); shutil.rmtree(os.path.dirname(d6))
+
+print("[17] 仕分けワーカー: 途中で例外が出ても完了通知を出す")
+from PySide6.QtCore import QCoreApplication
+from core.worker import SortWorker
+qapp = QCoreApplication.instance() or QCoreApplication([])
+not_dir = put(tempfile.mkdtemp(prefix="v2x_"), "フォルダではない")
+got, wlogs = [], []
+wk = SortWorker(not_dir)  # 現場フォルダが壊れている想定（ensure_structureで失敗）
+wk.finished_batch.connect(got.append)
+wk.log.connect(wlogs.append)
+wk.run()  # スレッドを起こさず同期実行
+check("finished_batch が必ず出る", got == [[]])
+check("エラー内容がログに出る", any(l.startswith("[エラー]") for l in wlogs))
+shutil.rmtree(os.path.dirname(not_dir))
+
 shutil.rmtree(base); shutil.rmtree(desk)
+shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
 sys.exit(1 if ng else 0)

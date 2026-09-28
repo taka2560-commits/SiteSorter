@@ -97,26 +97,17 @@ def unique_path(dst: str) -> str:
     return cand
 
 
-def _is_writing(path: str, interval: float = 0.5) -> bool:
-    """ファイルが書き込み中かどうかを検出（サイズ/更新日時の変化で判定）"""
-    try:
-        st1 = os.stat(path)
-        time.sleep(interval)
-        st2 = os.stat(path)
-        return (st1.st_size != st2.st_size
-                or st1.st_mtime_ns != st2.st_mtime_ns)
-    except OSError:
-        return True
+def _writing_set(files, interval=0.5):
+    """書き込み中（コピー途中等）のファイルの集合を返すバッチチェック。
 
-
-def _filter_writing(files, log_cb=None, skipped=None):
-    """書き込み中（コピー途中等）のファイルを除外するバッチチェック。
-
-    全ファイルのstat -> 0.5秒待機 -> 再stat で、サイズ/更新日時が変化した
-    ファイルを書き込み中とみなしスキップする。1回の待機で全ファイルを判定。
+    全ファイルのstat -> interval秒待機 -> 再stat で、サイズ/更新日時が変化した
+    （または読めなかった）ファイルを書き込み中とみなす。待機は1回だけなので、
+    ファイル数が増えても待ち時間は変わらない（ドロップ経路はGUIスレッドで動くため
+    ファイルごとに待たないこと）。
     """
+    files = list(files)
     if not files:
-        return files
+        return set()
     snap = {}
     for f in files:
         try:
@@ -124,16 +115,25 @@ def _filter_writing(files, log_cb=None, skipped=None):
             snap[f] = (st.st_size, st.st_mtime_ns)
         except OSError:
             snap[f] = None
-    time.sleep(0.5)
-    stable = []
+    time.sleep(interval)
+    writing = set()
     for f in files:
-        prev = snap.get(f)
         try:
             st = os.stat(f)
             cur = (st.st_size, st.st_mtime_ns)
         except OSError:
             cur = None
-        if prev is None or cur is None or prev != cur:
+        if snap[f] is None or cur is None or snap[f] != cur:
+            writing.add(f)
+    return writing
+
+
+def _filter_writing(files, log_cb=None, skipped=None):
+    """書き込み中のファイルを除外する（Inbox一括処理用）"""
+    writing = _writing_set(files)
+    stable = []
+    for f in files:
+        if f in writing:
             name = os.path.basename(f)
             if log_cb:
                 log_cb("[スキップ] %s: 書き込み中（コピー未完了の可能性）" % name)
@@ -143,6 +143,13 @@ def _filter_writing(files, log_cb=None, skipped=None):
         else:
             stable.append(f)
     return stable
+
+
+def _size_or_zero(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _chunk_copy(src, dst, progress_cb=None):
@@ -273,18 +280,24 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
     files = scan_inbox(base)
     # 書き込み中（Explorerでコピー途中等）のファイルを事前に除外
     files = _filter_writing(files, log_cb, skipped)
-    total_bytes = sum(os.path.getsize(f) for f in files) or 1
+    # 処理中にファイルが消えても止まらないよう、サイズは先に取得しておく
+    sizes = {f: _size_or_zero(f) for f in files}
+    total_bytes = sum(sizes.values()) or 1
     done = 0
     ops = []
     for src in files:
         name = os.path.basename(src)
-        size = os.path.getsize(src)
+        size = sizes[src]
         try:
             if is_transient(name):
                 continue  # ロック・一時ファイルは触らない
             if os.path.islink(src):
                 if log_cb:
                     log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
+                continue
+            if not os.path.isfile(src):
+                if log_cb:
+                    log_cb("[スキップ] %s: 見つかりません（移動・削除された可能性）" % name)
                 continue
             if is_locked(src):
                 if log_cb:
@@ -327,6 +340,11 @@ def ingest_drop(base, paths, toggle=None,
     ensure_structure(base)
     batch = _now()
     photo = rules.photo_dir()
+    # 書き込み中チェックはドロップ全体で1回だけ待機する
+    writing = _writing_set(
+        p for p in paths
+        if not os.path.islink(p) and os.path.isfile(p)
+        and not is_transient(os.path.basename(p)))
     ops = []
     for src in paths:
         name = os.path.basename(src)
@@ -344,8 +362,9 @@ def ingest_drop(base, paths, toggle=None,
                 if log_cb:
                     log_cb("[スキップ] %s: 一時/ロックファイル" % name)
                 continue
-            if is_locked(src) or _is_writing(src):
-                reason = "使用中" if is_locked(src) else "書き込み中"
+            locked = is_locked(src)
+            if locked or src in writing:
+                reason = "使用中" if locked else "書き込み中"
                 if log_cb:
                     log_cb("[スキップ] %s: %s" % (name, reason))
                 if skipped is not None:
@@ -424,22 +443,27 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
     if choice == "expand":
         for item in sorted(os.listdir(src)):  # 直下1階層のみ
             p = os.path.join(src, item)
-            if os.path.isdir(p):
-                actual = move_dir(p, os.path.join(base, rules.INBOX))
-                ops.append({"op": "move", "src": p, "dst": actual,
-                            "time": _now(), "batch": batch})
-            else:
-                folder = _resolve(p, resolver, log_cb)
-                if not folder:
-                    folder = rules.INBOX
-                dst = (_dest_for(base, p, folder, photo, log_cb)
-                       if folder != rules.INBOX
-                       else os.path.join(base, rules.INBOX, item))
-                actual = move_file(p, dst)
-                ops.append({"op": "move", "src": p, "dst": actual,
-                            "time": _now(), "batch": batch})
+            # 1件の失敗で残りの処理と移動済み分の履歴を失わないよう個別に捕捉
+            try:
+                if os.path.isdir(p):
+                    actual = move_dir(p, os.path.join(base, rules.INBOX))
+                    ops.append({"op": "move", "src": p, "dst": actual,
+                                "time": _now(), "batch": batch})
+                else:
+                    folder = _resolve(p, resolver, log_cb)
+                    if not folder:
+                        folder = rules.INBOX
+                    dst = (_dest_for(base, p, folder, photo, log_cb)
+                           if folder != rules.INBOX
+                           else os.path.join(base, rules.INBOX, item))
+                    actual = move_file(p, dst)
+                    ops.append({"op": "move", "src": p, "dst": actual,
+                                "time": _now(), "batch": batch})
+                    if log_cb:
+                        log_cb("%s → %s" % (item, os.path.relpath(actual, base)))
+            except (OSError, IOError) as e:
                 if log_cb:
-                    log_cb("%s → %s" % (item, os.path.relpath(actual, base)))
+                    log_cb("[スキップ] %s: %s" % (item, e))
         try:
             os.rmdir(src)  # 空になったら削除
         except OSError:
