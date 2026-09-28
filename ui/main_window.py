@@ -638,8 +638,10 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.log)
         self.worker.skipped_found.connect(self.add_retry_items)
         self.worker.finished_batch.connect(self._on_finished)
-        self._update_buttons()
+        # スレッド終了後にボタンを戻す（finished_batch の時点ではまだ実行中のことがある）
+        self.worker.finished.connect(self._update_buttons)
         self.worker.start()
+        self._update_buttons()  # start 後に判定しないと実行中扱いにならず二重実行できる
 
     def _on_finished(self, ops: list):
         self.history.record(ops)
