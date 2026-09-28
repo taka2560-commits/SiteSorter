@@ -7,10 +7,20 @@ import sys
 import tempfile
 from datetime import datetime
 
+# 設定の保存先を一時フォルダへ切り替えてから本体を読み込む。
+# このテストは rules.json を書き換え・削除するため、実環境の
+# %APPDATA%\SiteSorter（ユーザーのルール）を壊さないよう隔離する。
+DATA_TMP = tempfile.mkdtemp(prefix="sitesorter_data_")
+os.environ["APPDATA"] = DATA_TMP  # Windows
+os.environ["HOME"] = DATA_TMP     # Linux（~/.config）
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules
 from core.organizer import ensure_structure, organize, ingest_drop, scan_inbox, send_to_inbox
 from core.history import History
+
+if not rules.RULES_PATH.startswith(DATA_TMP):
+    sys.exit("中止: rules.json の保存先が一時フォルダではありません: " + rules.RULES_PATH)
 
 ok = ng = 0
 def check(name, cond):
@@ -192,5 +202,6 @@ check("EXIFなしフォールバック", any(
 shutil.rmtree(base2)
 
 shutil.rmtree(base); shutil.rmtree(desk)
+shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
 sys.exit(1 if ng else 0)

@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """Phase D テスト: 容量計算・旧版検知・新規現場テンプレ・アーカイブUndo"""
 import os, shutil, sys, tempfile, time
+# 実環境の %APPDATA%\SiteSorter に触れないよう、設定の保存先を一時フォルダへ切り替える
+DATA_TMP = tempfile.mkdtemp(prefix="sitesorter_data_")
+os.environ["APPDATA"] = DATA_TMP  # Windows
+os.environ["HOME"] = DATA_TMP     # Linux（~/.config）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules
 from core.capacity import calc
@@ -82,5 +86,6 @@ except ValueError:
     check("重複はエラー", True)
 
 shutil.rmtree(base); shutil.rmtree(tdir); shutil.rmtree(parent)
+shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
 sys.exit(1 if ng else 0)
