@@ -201,6 +201,34 @@ check("EXIFなしフォールバック", any(
     os.path.exists(os.path.join(base2, "30_現場写真", d, "スクショ.png")) for d in pdirs))
 shutil.rmtree(base2)
 
+print("[14] ドロップの書き込み中チェック（待機は1回だけ・判定は維持）")
+import threading
+import time
+base4 = tempfile.mkdtemp(prefix="v2w_")
+ensure_structure(base4)
+desk4 = tempfile.mkdtemp(prefix="desk4_")
+many = [put(desk4, "w%02d.dwg" % i) for i in range(6)]
+t0 = time.perf_counter()
+ops_w = ingest_drop(base4, many)
+check("6件でも待ちは1回分（2秒未満）", time.perf_counter() - t0 < 2.0 and len(ops_w) == 6)
+growing = put(desk4, "書込中.dwg")
+stop = threading.Event()
+def _writer():
+    with open(growing, "ab") as fw:
+        while not stop.is_set():
+            fw.write(b"x"); fw.flush(); time.sleep(0.02)
+th = threading.Thread(target=_writer); th.start()
+time.sleep(0.1)
+sk_w = []
+try:
+    ingest_drop(base4, [growing], toggle="receive", skipped=sk_w)
+finally:
+    stop.set(); th.join()
+check("書き込み中はスキップ（toggle付きで収集）", len(sk_w) == 1
+      and sk_w[0]["reason"] == "書き込み中" and sk_w[0]["toggle"] == "receive")
+check("書き込み中のファイルは元の場所に残る", os.path.exists(growing))
+shutil.rmtree(base4); shutil.rmtree(desk4)
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
