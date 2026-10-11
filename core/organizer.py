@@ -140,17 +140,39 @@ def _writing_set(files, interval=WRITE_CHECK_INTERVAL):
     return _changed_since(snap)
 
 
+QUIET_SECONDS = 2.0  # これ以上前から変化がないファイルは書き込み中チェックの待機を省く
+
+
+def _recently_changed(path, now):
+    """直近 QUIET_SECONDS 秒以内に作成・更新された（または状態が読めない）か。
+
+    コピー途中のファイルは作成・更新日時が「今」に近いので、必ず待機付きの
+    チェックに回る。何秒も前から変化のないファイル（エクスプローラから
+    ドラッグする通常のファイル）は待たずに移動し、一覧からすぐ消えるようにする。
+    使用中のファイルは別途 is_locked() で検出する。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    # Windows の st_ctime は作成日時、Linux は状態変更日時（どちらも新しい方で判定）
+    return now - max(st.st_mtime, st.st_ctime) < QUIET_SECONDS
+
+
 def _drop_targets(paths):
-    """ドロップ経路で書き込み中チェックの対象になる通常ファイル"""
+    """ドロップ経路で書き込み中チェックの対象になる通常ファイル（最近変化したもののみ）"""
+    now = time.time()
     return [p for p in paths
             if not os.path.islink(p) and os.path.isfile(p)
-            and not is_transient(os.path.basename(p))]
+            and not is_transient(os.path.basename(p))
+            and _recently_changed(p, now)]
 
 
 def drop_snapshot(paths):
     """ドロップ直後に取る1回目のstat（GUIを止めずに書き込み中チェックするため）。
 
-    呼び出し側は WRITE_CHECK_INTERVAL 秒後に ingest_drop(..., snapshot=戻り値) を呼ぶ。
+    呼び出し側は WRITE_CHECK_INTERVAL 秒後に ingest_drop(..., snapshot=戻り値) を呼ぶ
+    （戻り値が空＝最近変化したファイルがなければ待たずに呼んでよい）。
     その間に sleep せずイベントループを回すことで、ドロップ元（エクスプローラ）の
     ドラッグ操作がすぐ完了し、ドラッグ中の画像が画面に残らない。
     """

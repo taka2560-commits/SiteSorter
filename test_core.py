@@ -313,6 +313,26 @@ check("変化したファイルは書き込み中としてスキップ",
       os.path.exists(f_wr) and [s["reason"] for s in sk7] == ["書き込み中"])
 shutil.rmtree(base7); shutil.rmtree(desk7)
 
+print("[19] しばらく変化のないファイルは待たずに仕分け（エクスプローラからすぐ消える）")
+base8 = tempfile.mkdtemp(prefix="v2q_")
+desk8 = tempfile.mkdtemp(prefix="desk8_")
+f_old = put(desk8, "既存.dwg")
+_orig_quiet = org.QUIET_SECONDS
+org.QUIET_SECONDS = 0.2  # 作成日時は戻せないので、閾値を縮めて「古いファイル」を作る
+try:
+    time.sleep(0.3)
+    check("変化のないファイルはスナップショット対象外", drop_snapshot([f_old]) == {})
+    f_new = put(desk8, "作成直後.dwg")
+    check("作成直後のファイルはスナップショット対象", set(drop_snapshot([f_new])) == {f_new})
+    t0 = time.time()
+    ops8 = ingest_drop(base8, [f_old])
+    check("変化のないファイルだけなら待機しない", time.time() - t0 < 0.4)
+    check("待機なしでも仕分けされる",
+          os.path.exists(os.path.join(base8, rules.WORK_DIR, "既存.dwg")) and len(ops8) == 1)
+finally:
+    org.QUIET_SECONDS = _orig_quiet
+shutil.rmtree(base8); shutil.rmtree(desk8)
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")

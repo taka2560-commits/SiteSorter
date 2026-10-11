@@ -133,7 +133,9 @@ class DropZone(QWidget):
             return
         self.label.setText("⏳\n処理中…")
         snap = drop_snapshot(paths)
-        QTimer.singleShot(int(WRITE_CHECK_INTERVAL * 1000),
+        # 最近変化したファイルがなければ待たずに処理（エクスプローラの一覧からすぐ消える）
+        wait_ms = int(WRITE_CHECK_INTERVAL * 1000) if snap else 0
+        QTimer.singleShot(wait_ms,
                           lambda: self._process(base, paths, toggle, snap))
 
     def _process(self, base: str, paths: list, toggle, snap: dict):
