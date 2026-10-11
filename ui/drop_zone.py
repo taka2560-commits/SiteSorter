@@ -3,19 +3,23 @@
 import os
 
 from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
 from config import save_settings
-from core.organizer import WRITE_CHECK_INTERVAL, drop_snapshot, ingest_drop
+from core.organizer import (
+    WRITE_CHECK_INTERVAL, drop_snapshot, ingest_drop, summarize_ops,
+)
 from ui import dialogs, theme
 
 SITE_LABEL_CSS = ("font-size: 10px; color: rgba(255, 255, 255, 180); "
                   "background: transparent;")
 IDLE_TEXT = "📥\nここにドロップ\n＝即仕分け"
 W, H = 150, 196
+RESULT_MS = 8000   # 結果と「元に戻す」を出しておく時間
+NOTICE_MS = 1500   # 短い通知（未設定・Undo完了など）
 
 
 class DropZone(QWidget):
@@ -24,6 +28,10 @@ class DropZone(QWidget):
         self.settings = settings
         self.main_window = main_window
         self._drag_pos = None
+        self._undo_batch = None   # 直前のドロップのバッチID（「元に戻す」の対象）
+        self._reset_timer = QTimer(self)
+        self._reset_timer.setSingleShot(True)
+        self._reset_timer.timeout.connect(self._reset_label)
         self._idle = theme.drop_idle()
         self._active = theme.drop_active()
 
@@ -38,7 +46,17 @@ class DropZone(QWidget):
         lay = QVBoxLayout(inner)
         lay.setContentsMargins(8, 8, 8, 8)
         self.label = QLabel(IDLE_TEXT, alignment=Qt.AlignCenter)
+        self.label.setWordWrap(True)
         lay.addWidget(self.label, 1)
+
+        # 結果の直下に出す取り消しボタン（操作した場所で戻せるように）
+        self.btn_undo = QPushButton("↶ 元に戻す")
+        self.btn_undo.setFixedHeight(24)
+        self.btn_undo.setToolTip("今のドロップで移動・コピーしたファイルを元に戻します（Ctrl+Z）")
+        self.btn_undo.clicked.connect(self._undo_drop)
+        self.btn_undo.hide()
+        lay.addWidget(self.btn_undo)
+        QShortcut(QKeySequence.Undo, self, activated=self._undo_drop)
 
         trow = QHBoxLayout()
         self.tg_submit = QPushButton("提出用")
@@ -78,6 +96,10 @@ class DropZone(QWidget):
             f" border: none; font-weight: bold; }}")
         self.tg_submit.setStyleSheet(tg_css)
         self.tg_receive.setStyleSheet(tg_css)
+        self.btn_undo.setStyleSheet(
+            f"QPushButton {{ background: {c['surface']}; color: {c['text']};"
+            f" border: 1px solid {c['accent']}; border-radius: 6px;"
+            f" font-size: 11px; font-weight: bold; padding: 2px; }}")
 
     def set_site(self, name: str) -> None:
         self.site_label.setText(name or "（現場未設定）")
@@ -103,6 +125,7 @@ class DropZone(QWidget):
     # ---------- D&D（即時仕分け） ----------
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
+            self._reset_timer.stop()
             self.setStyleSheet(self._active)
             mode = {"submit": "提出処理", "receive": "受領保管"}.get(
                 self._toggle(), "仕分け")
@@ -126,10 +149,11 @@ class DropZone(QWidget):
         ドロップしたファイルの画像がしばらく画面に残ってしまう。
         """
         base = self.settings.get("site_folder")
+        self._clear_undo()
         if not base:
             self.setStyleSheet(self._idle)
             self.label.setText("⚠\n現場フォルダ\n未設定")
-            QTimer.singleShot(1500, self._reset_label)
+            self._reset_timer.start(NOTICE_MS)
             return
         self.label.setText("⏳\n処理中…")
         snap = drop_snapshot(paths)
@@ -148,16 +172,63 @@ class DropZone(QWidget):
         if sk:
             self.main_window.add_retry_items(sk)
         self.setStyleSheet(self._idle)
-        mode = {"submit": "提出", "receive": "受領"}.get(toggle, "処理")
-        self.label.setText(f"✔\n{len(ops)}件 {mode}")
+        self._show_result(base, ops, sk, toggle)
         self.tg_submit.setChecked(False)   # 事故防止: 処理後は自動OFF
         self.tg_receive.setChecked(False)
         self.main_window.refresh_inbox()
-        QTimer.singleShot(1500, self._reset_label)
+
+    def _show_result(self, base: str, ops: list, skipped: list, toggle):
+        """どこへ仕分けたか・未処理の有無を、ドロップした場所に表示する"""
+        mode = {"submit": "提出", "receive": "受領"}.get(toggle, "処理")
+        summary = summarize_ops(base, ops)
+        lines = [f"✔ {len(ops)}件 {mode}" if ops else "処理なし"]
+        if summary:
+            lines.append("→ " + summary[0][0])
+            if len(summary) == 2:
+                lines.append("＋ " + summary[1][0])
+            elif len(summary) > 2:
+                lines.append(f"ほか{len(summary) - 1}フォルダ")
+        if skipped:
+            lines.append(f"⚠ {len(skipped)}件 未処理")
+        self.label.setText("\n".join(lines))
+
+        tips = [f"{folder}: {n}件" for folder, n in summary]
+        if skipped:
+            tips.append("")
+            tips += [f"⚠ {os.path.basename(it['path'])}（{it['reason']}）"
+                     for it in skipped]
+            tips.append("メイン画面の「ロック中」ボタンから再試行できます")
+        self.label.setToolTip("\n".join(tips))
+
+        if ops:
+            self._undo_batch = ops[0].get("batch")
+            self.btn_undo.show()
+        self._reset_timer.start(RESULT_MS if ops or skipped else NOTICE_MS)
+
+    def _undo_drop(self):
+        """直前のドロップを取り消す（結果表示中のみ有効）"""
+        if not self._undo_batch:
+            return
+        batch = self._undo_batch
+        self._clear_undo()
+        n = self.main_window.history.undo_batch(batch, log_cb=self.main_window.log)
+        self.main_window.after_undo(n)
+        self.setStyleSheet(self._idle)
+        self.label.setText(f"↶\n{n}件 元に戻しました" if n
+                           else "元に戻せる操作が\nありません")
+        self.label.setToolTip("")
+        self._reset_timer.start(NOTICE_MS)
+
+    def _clear_undo(self):
+        self._undo_batch = None
+        self.btn_undo.hide()
 
     def _reset_label(self):
+        self._reset_timer.stop()
+        self._clear_undo()
         self.setStyleSheet(self._idle)
         self.label.setText(IDLE_TEXT)
+        self.label.setToolTip("")
 
     # ---------- ウィンドウのドラッグ移動 ----------
     def mousePressEvent(self, e):

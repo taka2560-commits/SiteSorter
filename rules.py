@@ -155,6 +155,23 @@ def photo_dir() -> str:
     return ""
 
 
+def zip_destinations(recent=()) -> list:
+    """zip の移動先候補。最近選んだ先 → 90_その他 → 12_社外受領データ → 残り。
+
+    候補が多いと選ぶのに時間がかかるため、よく使う先を上に寄せる。
+    rules.json の変更で無くなったフォルダは recent から除く。
+    """
+    cands = []
+    for f in sorted(FOLDERS) + [RECEIVE_DIR, OTHERS]:
+        if f not in cands:
+            cands.append(f)
+    head = []
+    for f in list(recent) + [OTHERS, RECEIVE_DIR]:
+        if f in cands and f not in head:
+            head.append(f)
+    return head + [f for f in cands if f not in head]
+
+
 def all_dirs() -> list:
     fixed = {INBOX, WORK_DIR, SUBMIT_DIR, RECEIVE_DIR, OTHERS, ARCHIVE}
     return sorted(fixed | set(FOLDERS))

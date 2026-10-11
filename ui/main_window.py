@@ -653,7 +653,10 @@ class MainWindow(QMainWindow):
         self._recalc_capacity()
 
     def _undo(self):
-        n = self.history.undo_last(log_cb=self.log)
+        self.after_undo(self.history.undo_last(log_cb=self.log))
+
+    def after_undo(self, n: int):
+        """Undo後の表示更新（メイン画面・ドロップゾーン共通）"""
         self.log(f"--- Undo完了: {n}操作を元に戻しました ---")
         self.refresh_inbox()
         if self.stack.currentIndex() == 1:

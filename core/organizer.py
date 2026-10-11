@@ -39,6 +39,11 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _batch_id() -> str:
+    """Undo単位のID。秒単位だと同じ秒の連続ドロップが1つにまとまるのでマイクロ秒まで"""
+    return datetime.now().isoformat(timespec="microseconds")
+
+
 def ensure_structure(base: str) -> None:
     for d in rules.all_dirs():
         os.makedirs(os.path.join(base, d), exist_ok=True)
@@ -326,7 +331,7 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
              skipped=None):
     """00_Inbox の一括仕分け。戻り値: 操作リスト（Undo用）"""
     ensure_structure(base)
-    batch = _now()
+    batch = _batch_id()
     photo = rules.photo_dir()
     files = scan_inbox(base)
     # 書き込み中（Explorerでコピー途中等）のファイルを事前に除外
@@ -391,7 +396,7 @@ def ingest_drop(base, paths, toggle=None,
     戻り値: 操作リスト（Undo用）
     """
     ensure_structure(base)
-    batch = _now()
+    batch = _batch_id()
     photo = rules.photo_dir()
     # 書き込み中チェックはドロップ全体で1回だけ待機する
     if snapshot is None:
@@ -469,6 +474,23 @@ def ingest_drop(base, paths, toggle=None,
             if log_cb:
                 log_cb("[スキップ] %s: %s" % (name, e))
     return ops
+
+
+def summarize_ops(base, ops):
+    """操作リストを移動先の第1階層フォルダごとに集計 → [(フォルダ名, 件数), ...]
+
+    件数の多い順（同数は先に出た順）。提出の同時コピーは2箇所それぞれに数える。
+    """
+    counts = {}
+    for op in ops:
+        for dst in (op.get("dst"), op.get("dst2")):
+            if not dst:
+                continue
+            rel = os.path.relpath(dst, base)
+            top = rel.split(os.sep)[0] if not rel.startswith("..") else \
+                os.path.basename(os.path.dirname(dst))
+            counts[top] = counts.get(top, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
 def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
@@ -553,7 +575,7 @@ def create_site(parent_dir, name, templates=None, log_cb=None):
 
 def archive_files(base, paths, log_cb=None):
     """承認済みの旧版ファイルを 99_Archive へ移動（Undo可能な操作リストを返す）"""
-    batch = _now()
+    batch = _batch_id()
     ops = []
     for src in paths:
         if not os.path.isfile(src):

@@ -3,6 +3,9 @@
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 import rules
+from config import save_settings
+
+ZIP_RECENT_MAX = 3
 
 
 def ask_multi(parent, name: str, candidates: list):
@@ -14,17 +17,25 @@ def ask_multi(parent, name: str, candidates: list):
     return item if ok else None
 
 def ask_zip(parent, name: str):
-    """zip（トグルなし）→ 移動先を選択。キャンセル=None"""
-    cands = []
-    for f in sorted(rules.FOLDERS) + [rules.RECEIVE_DIR, rules.OTHERS]:
-        if f not in cands:
-            cands.append(f)
+    """zip（トグルなし）→ 移動先を選択。キャンセル=None
+
+    最近選んだ移動先を上に並べ、前回の選択を初期値にする。
+    記憶は parent（メインウィンドウ）の settings["zip_recent"] に保存。
+    """
+    settings = getattr(parent, "settings", None)
+    recent = list((settings or {}).get("zip_recent") or [])
+    cands = rules.zip_destinations(recent)
     item, ok = QInputDialog.getItem(
         parent, "zipファイルの移動先",
-        f"「{name}」の移動先を選んでください。\n"
+        f"「{name}」の移動先を選んでください（上ほど最近使った移動先）。\n"
         "※納品zipはドロップゾーンの「提出用」トグルで 11_図面_提出済 へ入ります。",
-        cands, cands.index(rules.OTHERS), False)
-    return item if ok else None
+        cands, 0, False)
+    if not ok:
+        return None
+    if settings is not None:
+        settings["zip_recent"] = ([item] + [r for r in recent if r != item])[:ZIP_RECENT_MAX]
+        save_settings(settings)
+    return item
 
 
 def ask_folder(parent, name: str):

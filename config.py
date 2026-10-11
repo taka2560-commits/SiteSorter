@@ -44,6 +44,7 @@ DEFAULTS = {
     "capacity_threshold_gb": 100,
     "capacity_cache": {},        # {現場パス: {total, scan3d, time}}
     "templates": [],             # [{src, dst}] 新規現場の雛形配置
+    "zip_recent": [],            # zip の最近の移動先（先頭が最新・最大3件）
 }
 
 

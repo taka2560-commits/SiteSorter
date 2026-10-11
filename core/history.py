@@ -91,6 +91,23 @@ class History:
         self._save()
         return count
 
+    def undo_batch(self, batch, log_cb=None) -> int:
+        """指定バッチの操作一式をUndo（ドロップ直後の「元に戻す」用）。
+
+        その後に別の処理が記録されていても、このバッチだけを戻す。
+        既にUndo済み・履歴から押し出された場合は 0。
+        """
+        targets = [o for o in self.ops if o.get("batch") == batch]
+        if not targets:
+            return 0
+        self.ops = [o for o in self.ops if o.get("batch") != batch]
+        count = 0
+        for op in reversed(targets):
+            if self._undo_op(op, log_cb):
+                count += 1
+        self._save()
+        return count
+
     def undo_one(self, log_cb=None) -> int:
         """直近1操作のみUndo"""
         if not self.ops:

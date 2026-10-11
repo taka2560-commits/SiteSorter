@@ -333,6 +333,44 @@ finally:
     org.QUIET_SECONDS = _orig_quiet
 shutil.rmtree(base8); shutil.rmtree(desk8)
 
+print("[20] ドロップ結果の集計（移動先フォルダごと）")
+from core.organizer import summarize_ops
+base9 = tempfile.mkdtemp(prefix="v2s_")
+desk9 = tempfile.mkdtemp(prefix="desk9_")
+fs9 = [put(desk9, n) for n in ("a.dwg", "b.dwg", "c.sim", "d.dwg")]
+ops9 = ingest_drop(base9, fs9)
+sm9 = summarize_ops(base9, ops9)
+check("件数の多い順に集計", sm9 == [(rules.WORK_DIR, 3), ("20_測量データ", 1)])
+g9 = put(desk9, "提出図.dwg")
+check("提出の同時コピーは10と11の両方に数える",
+      dict(summarize_ops(base9, ingest_drop(base9, [g9], toggle="submit")))
+      == {rules.WORK_DIR: 1, rules.SUBMIT_DIR: 1})
+check("操作なしは空", summarize_ops(base9, []) == [])
+
+print("[21] ドロップ単位の元に戻す（後から別の処理があっても対象バッチだけ戻す）")
+h9 = History(os.path.join(base9, "h9.json"))
+h9.record(ops9)
+other = put(desk9, "別処理.dwg")
+ops_other = ingest_drop(base9, [other])
+h9.record(ops_other)
+n9 = h9.undo_batch(ops9[0]["batch"])
+check("対象バッチの4件が元の場所へ戻る",
+      n9 == 4 and all(os.path.exists(f) for f in fs9))
+check("後から行った別の処理は残る",
+      os.path.exists(os.path.join(base9, rules.WORK_DIR, "別処理.dwg"))
+      and len(h9.recent()) == len(ops_other))
+check("Undo済みのバッチは0件", h9.undo_batch(ops9[0]["batch"]) == 0)
+check("連続ドロップでもバッチIDは別", ops9[0]["batch"] != ops_other[0]["batch"])
+shutil.rmtree(base9); shutil.rmtree(desk9)
+
+print("[22] zipの移動先候補（最近使った先を上に）")
+z0 = rules.zip_destinations()
+check("履歴なしは90_その他が先頭（従来の初期値）", z0[0] == rules.OTHERS and z0[1] == rules.RECEIVE_DIR)
+z1 = rules.zip_destinations(["20_測量データ", rules.OTHERS])
+check("最近使った先が先頭に来る", z1[:3] == ["20_測量データ", rules.OTHERS, rules.RECEIVE_DIR])
+check("候補の集合は変わらない（重複なし）", sorted(z1) == sorted(z0) and len(set(z1)) == len(z1))
+check("ルールから消えたフォルダは無視", rules.zip_destinations(["存在しない"]) == z0)
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
