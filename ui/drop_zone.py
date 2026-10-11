@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import save_settings
-from core.organizer import ingest_drop
+from core.organizer import WRITE_CHECK_INTERVAL, drop_snapshot, ingest_drop
 from ui import dialogs, theme
 
 SITE_LABEL_CSS = ("font-size: 10px; color: rgba(255, 255, 255, 180); "
@@ -114,23 +114,34 @@ class DropZone(QWidget):
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
+        toggle = self._toggle()  # 「離して○○」と表示したモードで処理する
         e.acceptProposedAction()
         # エクスプローラ側を待たせないため、ドロップ完了後に処理
-        QTimer.singleShot(0, lambda: self._process(paths))
+        QTimer.singleShot(0, lambda: self._begin(paths, toggle))
 
-    def _process(self, paths: list):
+    def _begin(self, paths: list, toggle):
+        """書き込み中チェックの1回目のstatを取り、待機はイベントループに任せる。
+
+        ここで sleep するとエクスプローラのドラッグ操作が終われず、
+        ドロップしたファイルの画像がしばらく画面に残ってしまう。
+        """
         base = self.settings.get("site_folder")
         if not base:
             self.setStyleSheet(self._idle)
             self.label.setText("⚠\n現場フォルダ\n未設定")
             QTimer.singleShot(1500, self._reset_label)
             return
-        toggle = self._toggle()
+        self.label.setText("⏳\n処理中…")
+        snap = drop_snapshot(paths)
+        QTimer.singleShot(int(WRITE_CHECK_INTERVAL * 1000),
+                          lambda: self._process(base, paths, toggle, snap))
+
+    def _process(self, base: str, paths: list, toggle, snap: dict):
         resolver = dialogs.gui_resolver(self.main_window)
         sk = []
         ops = ingest_drop(base, paths, toggle=toggle,
                           log_cb=self.main_window.log, resolver=resolver,
-                          skipped=sk)
+                          skipped=sk, snapshot=snap)
         self.main_window.history.record(ops)
         if sk:
             self.main_window.add_retry_items(sk)

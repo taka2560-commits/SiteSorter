@@ -97,17 +97,11 @@ def unique_path(dst: str) -> str:
     return cand
 
 
-def _writing_set(files, interval=0.5):
-    """書き込み中（コピー途中等）のファイルの集合を返すバッチチェック。
+WRITE_CHECK_INTERVAL = 0.5  # 書き込み中チェックの2回のstatの間隔（秒）
 
-    全ファイルのstat -> interval秒待機 -> 再stat で、サイズ/更新日時が変化した
-    （または読めなかった）ファイルを書き込み中とみなす。待機は1回だけなので、
-    ファイル数が増えても待ち時間は変わらない（ドロップ経路はGUIスレッドで動くため
-    ファイルごとに待たないこと）。
-    """
-    files = list(files)
-    if not files:
-        return set()
+
+def _stat_snapshot(files):
+    """書き込み中チェックの1回目のstat: {パス: (サイズ, 更新日時) or None}"""
     snap = {}
     for f in files:
         try:
@@ -115,17 +109,52 @@ def _writing_set(files, interval=0.5):
             snap[f] = (st.st_size, st.st_mtime_ns)
         except OSError:
             snap[f] = None
-    time.sleep(interval)
+    return snap
+
+
+def _changed_since(snap):
+    """2回目のstat: サイズ/更新日時が変化した（または読めなかった）ファイルの集合"""
     writing = set()
-    for f in files:
+    for f, before in snap.items():
         try:
             st = os.stat(f)
             cur = (st.st_size, st.st_mtime_ns)
         except OSError:
             cur = None
-        if snap[f] is None or cur is None or snap[f] != cur:
+        if before is None or cur is None or before != cur:
             writing.add(f)
     return writing
+
+
+def _writing_set(files, interval=WRITE_CHECK_INTERVAL):
+    """書き込み中（コピー途中等）のファイルの集合を返すバッチチェック。
+
+    全ファイルのstat -> interval秒待機 -> 再stat で、サイズ/更新日時が変化した
+    （または読めなかった）ファイルを書き込み中とみなす。待機は1回だけなので、
+    ファイル数が増えても待ち時間は変わらない（ファイルごとに待たないこと）。
+    """
+    snap = _stat_snapshot(files)
+    if not snap:
+        return set()
+    time.sleep(interval)
+    return _changed_since(snap)
+
+
+def _drop_targets(paths):
+    """ドロップ経路で書き込み中チェックの対象になる通常ファイル"""
+    return [p for p in paths
+            if not os.path.islink(p) and os.path.isfile(p)
+            and not is_transient(os.path.basename(p))]
+
+
+def drop_snapshot(paths):
+    """ドロップ直後に取る1回目のstat（GUIを止めずに書き込み中チェックするため）。
+
+    呼び出し側は WRITE_CHECK_INTERVAL 秒後に ingest_drop(..., snapshot=戻り値) を呼ぶ。
+    その間に sleep せずイベントループを回すことで、ドロップ元（エクスプローラ）の
+    ドラッグ操作がすぐ完了し、ドラッグ中の画像が画面に残らない。
+    """
+    return _stat_snapshot(_drop_targets(paths))
 
 
 def _filter_writing(files, log_cb=None, skipped=None):
@@ -331,20 +360,22 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
 
 def ingest_drop(base, paths, toggle=None,
                 progress_cb=None, log_cb=None, resolver=None,
-                skipped=None):
+                skipped=None, snapshot=None):
     """ドロップ経路の即時仕分け。
 
     toggle: None / "submit"（提出） / "receive"（受領）
+    snapshot: drop_snapshot() の戻り値。渡すとここでは待たず、その時点からの
+              変化で書き込み中を判定する（GUI側で待機をイベントループに任せる場合）
     戻り値: 操作リスト（Undo用）
     """
     ensure_structure(base)
     batch = _now()
     photo = rules.photo_dir()
     # 書き込み中チェックはドロップ全体で1回だけ待機する
-    writing = _writing_set(
-        p for p in paths
-        if not os.path.islink(p) and os.path.isfile(p)
-        and not is_transient(os.path.basename(p)))
+    if snapshot is None:
+        writing = _writing_set(_drop_targets(paths))
+    else:
+        writing = _changed_since(snapshot)
     ops = []
     for src in paths:
         name = os.path.basename(src)

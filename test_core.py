@@ -293,6 +293,26 @@ check("finished_batch が必ず出る", got == [[]])
 check("エラー内容がログに出る", any(l.startswith("[エラー]") for l in wlogs))
 shutil.rmtree(os.path.dirname(not_dir))
 
+print("[18] ドロップの書き込み中チェック（GUIで待たない経路: drop_snapshot）")
+from core.organizer import drop_snapshot
+base7 = tempfile.mkdtemp(prefix="v2w_")
+desk7 = tempfile.mkdtemp(prefix="desk7_")
+f_ok = put(desk7, "静止.dwg")
+f_wr = put(desk7, "書込中.dwg")
+snap7 = drop_snapshot([f_ok, f_wr, desk7])
+check("スナップショットは通常ファイルのみ", set(snap7) == {f_ok, f_wr})
+with open(f_wr, "ab") as fh:  # 待機中にサイズが変わった＝コピー途中
+    fh.write(b"more")
+sk7 = []
+t0 = time.time()
+ops7 = ingest_drop(base7, [f_ok, f_wr], skipped=sk7, snapshot=snap7)
+check("snapshot指定時はingest_dropが待機しない", time.time() - t0 < 0.4)
+check("変化なしのファイルは仕分けされる",
+      os.path.exists(os.path.join(base7, rules.WORK_DIR, "静止.dwg")) and len(ops7) == 1)
+check("変化したファイルは書き込み中としてスキップ",
+      os.path.exists(f_wr) and [s["reason"] for s in sk7] == ["書き込み中"])
+shutil.rmtree(base7); shutil.rmtree(desk7)
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
