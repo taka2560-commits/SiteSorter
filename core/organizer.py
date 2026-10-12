@@ -509,11 +509,19 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
         if log_cb:
             log_cb("[スキップ] フォルダ %s: 提出トグルはファイルのみ対象" % name)
         return ops
-    # 通常: resolver("folder")で expand / keep を選択。既定=keep（Inboxへ維持移動）
+    # 通常: resolver("folder")で expand / keep / others を選択。既定=keep（Inboxへ維持移動）
     choice = resolver("folder", name, None) if resolver else "keep"
     if choice is None:  # キャンセル → 元の場所に残す
         if log_cb:
             log_cb("[キャンセル] フォルダ %s: 処理を中止（元の場所に残します）" % name)
+        return ops
+    if choice == "others":
+        # 解体せず 90_その他 へ丸ごと（仕分け不要のフォルダ用）
+        actual = move_dir(src, os.path.join(base, rules.OTHERS))
+        ops.append({"op": "move", "src": src, "dst": actual,
+                    "time": _now(), "batch": batch})
+        if log_cb:
+            log_cb("フォルダ %s → %s（丸ごと）" % (name, rules.OTHERS))
         return ops
     if choice == "expand":
         for item in sorted(os.listdir(src)):  # 直下1階層のみ

@@ -371,6 +371,22 @@ check("最近使った先が先頭に来る", z1[:3] == ["20_測量データ", r
 check("候補の集合は変わらない（重複なし）", sorted(z1) == sorted(z0) and len(set(z1)) == len(z1))
 check("ルールから消えたフォルダは無視", rules.zip_destinations(["存在しない"]) == z0)
 
+print("[23] フォルダを丸ごと90_その他へ")
+base10 = tempfile.mkdtemp(prefix="v2o_")
+dO = os.path.join(tempfile.mkdtemp(prefix="desk10_"), "雑多な資料")
+put(dO, "a.dwg"); put(os.path.join(dO, "sub"), "b.txt")
+opsO = ingest_drop(base10, [dO], resolver=lambda k, n, c: "others" if k == "folder" else None)
+moved = os.path.join(base10, rules.OTHERS, "雑多な資料")
+check("フォルダが中身ごと90_その他へ（解体しない）",
+      os.path.exists(os.path.join(moved, "a.dwg"))
+      and os.path.exists(os.path.join(moved, "sub", "b.txt")) and not os.path.exists(dO))
+check("1操作として記録・集計は90_その他",
+      len(opsO) == 1 and summarize_ops(base10, opsO) == [(rules.OTHERS, 1)])
+hO = History(os.path.join(base10, "hO.json")); hO.record(opsO)
+check("元に戻すと元の場所へ戻る",
+      hO.undo_batch(opsO[0]["batch"]) == 1 and os.path.exists(os.path.join(dO, "sub", "b.txt")))
+shutil.rmtree(base10); shutil.rmtree(os.path.dirname(dO))
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")
