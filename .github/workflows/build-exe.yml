@@ -1,0 +1,46 @@
+# Windows 用の配布 EXE（dist\SiteSorter.exe）をビルドする。
+# ビルド手順は build.bat と同じ。成果物は Actions の実行結果から「SiteSorter-exe」として取得できる。
+name: Build EXE
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONIOENCODING: utf-8
+        run: |
+          python test_core.py
+          python test_phase_d.py
+          python test_phase_e.py
+
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --onefile --noconsole
+          --name SiteSorter
+          --icon assets\app.ico
+          --add-data "assets;assets"
+          --collect-data qtawesome
+          main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SiteSorter-exe
+          path: dist/SiteSorter.exe
+          if-no-files-found: error

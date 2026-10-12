@@ -2,7 +2,7 @@
 """① メインウィンドウ（サイドバー＋3ページ構成）"""
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
@@ -76,9 +76,10 @@ class DropFrame(QFrame):
     def dropEvent(self, e):
         self._set_hot(False)
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
-        if paths:
-            self.dropped.emit(paths)
         e.acceptProposedAction()
+        if paths:
+            # エクスプローラ側を待たせないため、ドロップ完了後に移動する
+            QTimer.singleShot(0, lambda: self.dropped.emit(paths))
 
 
 class MainWindow(QMainWindow):
@@ -652,7 +653,10 @@ class MainWindow(QMainWindow):
         self._recalc_capacity()
 
     def _undo(self):
-        n = self.history.undo_last(log_cb=self.log)
+        self.after_undo(self.history.undo_last(log_cb=self.log))
+
+    def after_undo(self, n: int):
+        """Undo後の表示更新（メイン画面・ドロップゾーン共通）"""
         self.log(f"--- Undo完了: {n}操作を元に戻しました ---")
         self.refresh_inbox()
         if self.stack.currentIndex() == 1:

@@ -293,6 +293,84 @@ check("finished_batch が必ず出る", got == [[]])
 check("エラー内容がログに出る", any(l.startswith("[エラー]") for l in wlogs))
 shutil.rmtree(os.path.dirname(not_dir))
 
+print("[18] ドロップの書き込み中チェック（GUIで待たない経路: drop_snapshot）")
+from core.organizer import drop_snapshot
+base7 = tempfile.mkdtemp(prefix="v2w_")
+desk7 = tempfile.mkdtemp(prefix="desk7_")
+f_ok = put(desk7, "静止.dwg")
+f_wr = put(desk7, "書込中.dwg")
+snap7 = drop_snapshot([f_ok, f_wr, desk7])
+check("スナップショットは通常ファイルのみ", set(snap7) == {f_ok, f_wr})
+with open(f_wr, "ab") as fh:  # 待機中にサイズが変わった＝コピー途中
+    fh.write(b"more")
+sk7 = []
+t0 = time.time()
+ops7 = ingest_drop(base7, [f_ok, f_wr], skipped=sk7, snapshot=snap7)
+check("snapshot指定時はingest_dropが待機しない", time.time() - t0 < 0.4)
+check("変化なしのファイルは仕分けされる",
+      os.path.exists(os.path.join(base7, rules.WORK_DIR, "静止.dwg")) and len(ops7) == 1)
+check("変化したファイルは書き込み中としてスキップ",
+      os.path.exists(f_wr) and [s["reason"] for s in sk7] == ["書き込み中"])
+shutil.rmtree(base7); shutil.rmtree(desk7)
+
+print("[19] しばらく変化のないファイルは待たずに仕分け（エクスプローラからすぐ消える）")
+base8 = tempfile.mkdtemp(prefix="v2q_")
+desk8 = tempfile.mkdtemp(prefix="desk8_")
+f_old = put(desk8, "既存.dwg")
+_orig_quiet = org.QUIET_SECONDS
+org.QUIET_SECONDS = 0.2  # 作成日時は戻せないので、閾値を縮めて「古いファイル」を作る
+try:
+    time.sleep(0.3)
+    check("変化のないファイルはスナップショット対象外", drop_snapshot([f_old]) == {})
+    f_new = put(desk8, "作成直後.dwg")
+    check("作成直後のファイルはスナップショット対象", set(drop_snapshot([f_new])) == {f_new})
+    t0 = time.time()
+    ops8 = ingest_drop(base8, [f_old])
+    check("変化のないファイルだけなら待機しない", time.time() - t0 < 0.4)
+    check("待機なしでも仕分けされる",
+          os.path.exists(os.path.join(base8, rules.WORK_DIR, "既存.dwg")) and len(ops8) == 1)
+finally:
+    org.QUIET_SECONDS = _orig_quiet
+shutil.rmtree(base8); shutil.rmtree(desk8)
+
+print("[20] ドロップ結果の集計（移動先フォルダごと）")
+from core.organizer import summarize_ops
+base9 = tempfile.mkdtemp(prefix="v2s_")
+desk9 = tempfile.mkdtemp(prefix="desk9_")
+fs9 = [put(desk9, n) for n in ("a.dwg", "b.dwg", "c.sim", "d.dwg")]
+ops9 = ingest_drop(base9, fs9)
+sm9 = summarize_ops(base9, ops9)
+check("件数の多い順に集計", sm9 == [(rules.WORK_DIR, 3), ("20_測量データ", 1)])
+g9 = put(desk9, "提出図.dwg")
+check("提出の同時コピーは10と11の両方に数える",
+      dict(summarize_ops(base9, ingest_drop(base9, [g9], toggle="submit")))
+      == {rules.WORK_DIR: 1, rules.SUBMIT_DIR: 1})
+check("操作なしは空", summarize_ops(base9, []) == [])
+
+print("[21] ドロップ単位の元に戻す（後から別の処理があっても対象バッチだけ戻す）")
+h9 = History(os.path.join(base9, "h9.json"))
+h9.record(ops9)
+other = put(desk9, "別処理.dwg")
+ops_other = ingest_drop(base9, [other])
+h9.record(ops_other)
+n9 = h9.undo_batch(ops9[0]["batch"])
+check("対象バッチの4件が元の場所へ戻る",
+      n9 == 4 and all(os.path.exists(f) for f in fs9))
+check("後から行った別の処理は残る",
+      os.path.exists(os.path.join(base9, rules.WORK_DIR, "別処理.dwg"))
+      and len(h9.recent()) == len(ops_other))
+check("Undo済みのバッチは0件", h9.undo_batch(ops9[0]["batch"]) == 0)
+check("連続ドロップでもバッチIDは別", ops9[0]["batch"] != ops_other[0]["batch"])
+shutil.rmtree(base9); shutil.rmtree(desk9)
+
+print("[22] zipの移動先候補（最近使った先を上に）")
+z0 = rules.zip_destinations()
+check("履歴なしは90_その他が先頭（従来の初期値）", z0[0] == rules.OTHERS and z0[1] == rules.RECEIVE_DIR)
+z1 = rules.zip_destinations(["20_測量データ", rules.OTHERS])
+check("最近使った先が先頭に来る", z1[:3] == ["20_測量データ", rules.OTHERS, rules.RECEIVE_DIR])
+check("候補の集合は変わらない（重複なし）", sorted(z1) == sorted(z0) and len(set(z1)) == len(z1))
+check("ルールから消えたフォルダは無視", rules.zip_destinations(["存在しない"]) == z0)
+
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)
 print(f"\n結果: OK={ok} NG={ng}")

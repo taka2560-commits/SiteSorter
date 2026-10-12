@@ -39,6 +39,11 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _batch_id() -> str:
+    """Undo単位のID。秒単位だと同じ秒の連続ドロップが1つにまとまるのでマイクロ秒まで"""
+    return datetime.now().isoformat(timespec="microseconds")
+
+
 def ensure_structure(base: str) -> None:
     for d in rules.all_dirs():
         os.makedirs(os.path.join(base, d), exist_ok=True)
@@ -97,17 +102,11 @@ def unique_path(dst: str) -> str:
     return cand
 
 
-def _writing_set(files, interval=0.5):
-    """書き込み中（コピー途中等）のファイルの集合を返すバッチチェック。
+WRITE_CHECK_INTERVAL = 0.5  # 書き込み中チェックの2回のstatの間隔（秒）
 
-    全ファイルのstat -> interval秒待機 -> 再stat で、サイズ/更新日時が変化した
-    （または読めなかった）ファイルを書き込み中とみなす。待機は1回だけなので、
-    ファイル数が増えても待ち時間は変わらない（ドロップ経路はGUIスレッドで動くため
-    ファイルごとに待たないこと）。
-    """
-    files = list(files)
-    if not files:
-        return set()
+
+def _stat_snapshot(files):
+    """書き込み中チェックの1回目のstat: {パス: (サイズ, 更新日時) or None}"""
     snap = {}
     for f in files:
         try:
@@ -115,17 +114,74 @@ def _writing_set(files, interval=0.5):
             snap[f] = (st.st_size, st.st_mtime_ns)
         except OSError:
             snap[f] = None
-    time.sleep(interval)
+    return snap
+
+
+def _changed_since(snap):
+    """2回目のstat: サイズ/更新日時が変化した（または読めなかった）ファイルの集合"""
     writing = set()
-    for f in files:
+    for f, before in snap.items():
         try:
             st = os.stat(f)
             cur = (st.st_size, st.st_mtime_ns)
         except OSError:
             cur = None
-        if snap[f] is None or cur is None or snap[f] != cur:
+        if before is None or cur is None or before != cur:
             writing.add(f)
     return writing
+
+
+def _writing_set(files, interval=WRITE_CHECK_INTERVAL):
+    """書き込み中（コピー途中等）のファイルの集合を返すバッチチェック。
+
+    全ファイルのstat -> interval秒待機 -> 再stat で、サイズ/更新日時が変化した
+    （または読めなかった）ファイルを書き込み中とみなす。待機は1回だけなので、
+    ファイル数が増えても待ち時間は変わらない（ファイルごとに待たないこと）。
+    """
+    snap = _stat_snapshot(files)
+    if not snap:
+        return set()
+    time.sleep(interval)
+    return _changed_since(snap)
+
+
+QUIET_SECONDS = 2.0  # これ以上前から変化がないファイルは書き込み中チェックの待機を省く
+
+
+def _recently_changed(path, now):
+    """直近 QUIET_SECONDS 秒以内に作成・更新された（または状態が読めない）か。
+
+    コピー途中のファイルは作成・更新日時が「今」に近いので、必ず待機付きの
+    チェックに回る。何秒も前から変化のないファイル（エクスプローラから
+    ドラッグする通常のファイル）は待たずに移動し、一覧からすぐ消えるようにする。
+    使用中のファイルは別途 is_locked() で検出する。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    # Windows の st_ctime は作成日時、Linux は状態変更日時（どちらも新しい方で判定）
+    return now - max(st.st_mtime, st.st_ctime) < QUIET_SECONDS
+
+
+def _drop_targets(paths):
+    """ドロップ経路で書き込み中チェックの対象になる通常ファイル（最近変化したもののみ）"""
+    now = time.time()
+    return [p for p in paths
+            if not os.path.islink(p) and os.path.isfile(p)
+            and not is_transient(os.path.basename(p))
+            and _recently_changed(p, now)]
+
+
+def drop_snapshot(paths):
+    """ドロップ直後に取る1回目のstat（GUIを止めずに書き込み中チェックするため）。
+
+    呼び出し側は WRITE_CHECK_INTERVAL 秒後に ingest_drop(..., snapshot=戻り値) を呼ぶ
+    （戻り値が空＝最近変化したファイルがなければ待たずに呼んでよい）。
+    その間に sleep せずイベントループを回すことで、ドロップ元（エクスプローラ）の
+    ドラッグ操作がすぐ完了し、ドラッグ中の画像が画面に残らない。
+    """
+    return _stat_snapshot(_drop_targets(paths))
 
 
 def _filter_writing(files, log_cb=None, skipped=None):
@@ -275,7 +331,7 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
              skipped=None):
     """00_Inbox の一括仕分け。戻り値: 操作リスト（Undo用）"""
     ensure_structure(base)
-    batch = _now()
+    batch = _batch_id()
     photo = rules.photo_dir()
     files = scan_inbox(base)
     # 書き込み中（Explorerでコピー途中等）のファイルを事前に除外
@@ -331,20 +387,22 @@ def organize(base, progress_cb=None, log_cb=None, resolver=None,
 
 def ingest_drop(base, paths, toggle=None,
                 progress_cb=None, log_cb=None, resolver=None,
-                skipped=None):
+                skipped=None, snapshot=None):
     """ドロップ経路の即時仕分け。
 
     toggle: None / "submit"（提出） / "receive"（受領）
+    snapshot: drop_snapshot() の戻り値。渡すとここでは待たず、その時点からの
+              変化で書き込み中を判定する（GUI側で待機をイベントループに任せる場合）
     戻り値: 操作リスト（Undo用）
     """
     ensure_structure(base)
-    batch = _now()
+    batch = _batch_id()
     photo = rules.photo_dir()
     # 書き込み中チェックはドロップ全体で1回だけ待機する
-    writing = _writing_set(
-        p for p in paths
-        if not os.path.islink(p) and os.path.isfile(p)
-        and not is_transient(os.path.basename(p)))
+    if snapshot is None:
+        writing = _writing_set(_drop_targets(paths))
+    else:
+        writing = _changed_since(snapshot)
     ops = []
     for src in paths:
         name = os.path.basename(src)
@@ -416,6 +474,23 @@ def ingest_drop(base, paths, toggle=None,
             if log_cb:
                 log_cb("[スキップ] %s: %s" % (name, e))
     return ops
+
+
+def summarize_ops(base, ops):
+    """操作リストを移動先の第1階層フォルダごとに集計 → [(フォルダ名, 件数), ...]
+
+    件数の多い順（同数は先に出た順）。提出の同時コピーは2箇所それぞれに数える。
+    """
+    counts = {}
+    for op in ops:
+        for dst in (op.get("dst"), op.get("dst2")):
+            if not dst:
+                continue
+            rel = os.path.relpath(dst, base)
+            top = rel.split(os.sep)[0] if not rel.startswith("..") else \
+                os.path.basename(os.path.dirname(dst))
+            counts[top] = counts.get(top, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
 def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
@@ -500,7 +575,7 @@ def create_site(parent_dir, name, templates=None, log_cb=None):
 
 def archive_files(base, paths, log_cb=None):
     """承認済みの旧版ファイルを 99_Archive へ移動（Undo可能な操作リストを返す）"""
-    batch = _now()
+    batch = _batch_id()
     ops = []
     for src in paths:
         if not os.path.isfile(src):
