@@ -39,12 +39,13 @@ def ask_zip(parent, name: str):
 
 
 def ask_folder(parent, name: str):
-    """フォルダ投入（トグルなし）→ expand / keep / None（キャンセル）"""
+    """フォルダ投入（トグルなし）→ expand / keep / others / None（キャンセル）"""
     box = QMessageBox(parent)
     box.setWindowTitle("フォルダの処理方法")
     box.setText(f"フォルダ「{name}」が投入されました。\nどう処理しますか？")
     b_expand = box.addButton("個別仕分け（直下1階層のみ）", QMessageBox.AcceptRole)
     b_keep = box.addButton("丸ごとInboxへ維持移動", QMessageBox.AcceptRole)
+    b_others = box.addButton(f"丸ごと{rules.OTHERS}へ", QMessageBox.AcceptRole)
     box.addButton("キャンセル", QMessageBox.RejectRole)
     box.exec()
     clicked = box.clickedButton()
@@ -52,6 +53,8 @@ def ask_folder(parent, name: str):
         return "expand"
     if clicked is b_keep:
         return "keep"
+    if clicked is b_others:
+        return "others"
     return None
 
 

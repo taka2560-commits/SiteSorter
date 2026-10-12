@@ -66,7 +66,7 @@ ui/
 
 **ドラッグ＆ドロップ（DropZone）:**
 1. `organizer.ingest_drop(base, paths, toggle)` — ファイルを即時分類・移動
-2. トグルモードで移動先が変わる: `None` = 通常分類、`submit` = 11 または 10、`receive` = 12
+2. トグルモードで移動先が変わる: `None` = 通常分類、`submit` = 11 または 10、`receive` = 12。フォルダ（トグルなし）は `resolver("folder")` で `expand`（直下を個別仕分け）/ `keep`（丸ごと Inbox）/ `others`（丸ごと 90_その他）/ `None`（キャンセル）
 3. ロック中・書き込み中ファイルは理由をログに残してスキップ
 4. 結果（`summarize_ops()` による移動先フォルダ別の件数・未処理件数）をドロップゾーンに表示し、表示中は「元に戻す」/ Ctrl+Z で `History.undo_batch()` によりそのドロップのバッチだけを取り消す（バッチIDは `_batch_id()` でマイクロ秒単位）
 
