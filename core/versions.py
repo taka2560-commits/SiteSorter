@@ -3,7 +3,8 @@
 
 同名ベース＋版番号/日付サフィックス（_v2 / (2) / _20260601 / 2026-06-01 / rev3 等）
 のグループから、最新（更新日時が最も新しい）以外を旧版候補として返す。
-00_Inbox / 11_図面_提出済 / 12_社外受領データ / 99_Archive は対象外。
+00_Inbox / 11_図面_提出済 / 12_社外受領データ / 99_Archive / 30_現場写真 /
+21_3Dスキャン は対象外。
 """
 import os
 import re
@@ -16,7 +17,10 @@ SUFFIX_RE = re.compile(
     r"(?:[\s_\-]*(?:[vV]\.?\d{1,3}|\(\d+\)|\d{8}(?:_\d{6})?"
     r"|\d{4}-\d{2}-\d{2}|[rR][eE][vV]\.?\d{1,3}))+$")
 
-EXCLUDE_TOPS = {rules.INBOX, rules.SUBMIT_DIR, rules.RECEIVE_DIR, rules.ARCHIVE}
+# 写真（「現場 (2).jpg」「現場_20260601.jpg」は別の写真）と3Dスキャン（連番・日付付きの
+# スキャンデータ）は版違いではないので対象外
+EXCLUDE_TOPS = {rules.INBOX, rules.SUBMIT_DIR, rules.RECEIVE_DIR, rules.ARCHIVE,
+                "30_現場写真", "21_3Dスキャン"}
 
 
 def base_key(stem: str) -> str:
@@ -28,11 +32,15 @@ def base_key(stem: str) -> str:
 def find_old_candidates(base: str) -> list:
     """旧版候補 [{"path", "rel", "keep"}...] を返す（keep=残す最新版の相対パス）"""
     out = []
+    exclude = set(EXCLUDE_TOPS)
+    photo = rules.photo_dir()
+    if photo:  # ルール編集で写真フォルダ名を変えていても除外する
+        exclude.add(photo.replace("\\", "/").split("/")[0])
     for dirpath, dirs, files in os.walk(base):
         rel = os.path.relpath(dirpath, base)
         if rel != ".":
             top = rel.split(os.sep)[0]
-            if top in EXCLUDE_TOPS:
+            if top in exclude:
                 dirs[:] = []
                 continue
         groups = {}

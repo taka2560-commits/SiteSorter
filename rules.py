@@ -2,9 +2,8 @@
 """仕分けルール定義 v2（rules.json: 拡張子＋キーワード辞書。GUIから編集可能）"""
 import json
 import os
-import sys
 
-from config import RULES_PATH as _CONFIG_RULES_PATH
+from config import RULES_PATH as _CONFIG_RULES_PATH, write_json_atomic
 
 RULES_PATH = _CONFIG_RULES_PATH  # %APPDATA%\SiteSorter\rules.json
 
@@ -48,6 +47,14 @@ PROJECT_EXTS = []
 RULES = {}  # v1互換エイリアス（= FOLDERS）
 
 
+def _as_list(v):
+    """手編集の rules.json で "報告書" のように文字列1つが書かれても1語として扱う
+    （そのまま回すと1文字ずつのキーワードになり、ほぼ全ファイルが一致してしまう）"""
+    if isinstance(v, str):
+        return v.replace(",", " ").split()
+    return v if isinstance(v, (list, tuple, set)) else []
+
+
 def _norm_exts(exts):
     out = set()
     for e in exts:
@@ -61,10 +68,10 @@ def _norm_exts(exts):
 
 def _apply(data: dict) -> None:
     global FOLDERS, KEYWORDS, PROJECT_EXTS, RULES
-    FOLDERS = {str(f).strip(): _norm_exts(x)
-               for f, x in data.get("folders", {}).items() if str(f).strip()}
-    KEYWORDS = {str(f).strip(): [str(k) for k in kws if str(k).strip()]
-                for f, kws in data.get("keywords", {}).items() if str(f).strip()}
+    FOLDERS = {str(f).strip(): _norm_exts(_as_list(x))
+               for f, x in data.get("folders", {}).items() if valid_folder_name(f)}
+    KEYWORDS = {str(f).strip(): [str(k) for k in _as_list(kws) if str(k).strip()]
+                for f, kws in data.get("keywords", {}).items() if valid_folder_name(f)}
     PROJECT_EXTS = sorted(_norm_exts(data.get("project_exts", [])))
     if PROJECT_FOLDER in FOLDERS:
         FOLDERS[PROJECT_FOLDER] |= set(PROJECT_EXTS)
@@ -108,8 +115,26 @@ def _migrate_drawing_pdf(data: dict) -> bool:
 
 
 def _save_raw(data: dict) -> None:
-    with open(RULES_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    write_json_atomic(RULES_PATH, data, indent=2)
+
+
+_BAD_CHARS = set('<>:"|?*')
+
+
+def valid_folder_name(name: str) -> bool:
+    """仕分け先フォルダ名として使えるか（現場フォルダ内の相対パスに限る）。
+
+    「21_3Dスキャン/03_エクスポート点群」のような / 区切りのサブフォルダは可。
+    絶対パス・ドライブ指定・.. ・Windows で使えない文字は不可（現場の外に
+    フォルダやファイルを作らないため）。
+    """
+    name = str(name).strip()
+    if not name or os.path.isabs(name) or name.startswith(("/", "\\")):
+        return False
+    if any(c in _BAD_CHARS for c in name):
+        return False
+    parts = name.replace("\\", "/").split("/")
+    return all(p.strip() and p.strip() not in (".", "..") for p in parts)
 
 
 def load_rules() -> None:

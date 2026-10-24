@@ -29,6 +29,7 @@ jobs:
           python test_core.py
           python test_phase_d.py
           python test_phase_e.py
+          python test_ui.py
 
       - name: Build
         run: >

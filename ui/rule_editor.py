@@ -111,6 +111,9 @@ class RuleEditor(QDialog):
         for r, folder, raw in _rows(self.ext_table):
             if not folder:
                 return self._err(f"拡張子タブ {r + 1}行目: フォルダ名が空です。")
+            if not rules.valid_folder_name(folder):
+                return self._err(f"「{folder}」はフォルダ名として使えません"
+                                 "（現場フォルダ内の名前のみ。絶対パス・.. ・<>:\"|?* は不可）。")
             if folder in FIXED:
                 return self._err(f"「{folder}」は固定フォルダのため指定できません。")
             if folder in folders:
@@ -135,6 +138,9 @@ class RuleEditor(QDialog):
         for r, folder, raw in _rows(self.kw_table):
             if not folder:
                 return self._err(f"キーワードタブ {r + 1}行目: フォルダ名が空です。")
+            if not rules.valid_folder_name(folder):
+                return self._err(f"「{folder}」はフォルダ名として使えません"
+                                 "（現場フォルダ内の名前のみ。絶対パス・.. ・<>:\"|?* は不可）。")
             if folder == rules.SUBMIT_DIR:
                 return self._err(f"{rules.SUBMIT_DIR} にキーワードは設定できません（聖域）。")
             if folder in (rules.INBOX, rules.OTHERS, rules.ARCHIVE):
@@ -145,5 +151,8 @@ class RuleEditor(QDialog):
             if kws:
                 keywords[folder] = kws
 
-        rules.save_rules(folders=folders, keywords=keywords)
+        try:
+            rules.save_rules(folders=folders, keywords=keywords)
+        except OSError as e:
+            return self._err(f"rules.json を保存できませんでした: {e}")
         self.accept()

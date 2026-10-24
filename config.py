@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""設定の読み書き。保存先は %APPDATA%\SiteSorter（exe化対応）。
+r"""設定の読み書き。保存先は %APPDATA%\SiteSorter（exe化対応）。
 
 旧配置（アプリフォルダ直下）の settings.json / history.json / rules.json は
 初回起動時に自動で新配置へコピーされる。
@@ -71,14 +71,41 @@ def load_settings() -> dict:
         warnings.warn("settings.json の読み込みに失敗しました: %s" % e, UserWarning)
         data = {}
 
+    if not isinstance(data, dict):
+        warnings.warn("settings.json の形式が不正です（デフォルト設定で起動）", UserWarning)
+        data = {}
+    if not data:
+        _backup_broken(SETTINGS_PATH)
     merged = dict(DEFAULTS)
     merged.update(data)
     return merged
 
 
+def _backup_broken(path: str) -> None:
+    """読めなかった設定ファイルを .broken として残す（次の保存で上書きされて失われないように）"""
+    try:
+        if os.path.getsize(path) > 2:  # 空・{} は退避不要
+            shutil.copy2(path, path + ".broken")
+    except OSError:
+        pass
+
+
+def write_json_atomic(path: str, data, indent=2) -> None:
+    """JSON を一時ファイルに書いてから置き換える。
+
+    書き込み中の停電・強制終了でファイルが途中で切れ、設定や履歴が
+    丸ごと失われるのを防ぐ。
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_settings(settings: dict) -> None:
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+    write_json_atomic(SETTINGS_PATH, settings, indent=2)
 
 
 def resource_path(rel: str) -> str:

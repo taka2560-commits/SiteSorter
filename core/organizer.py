@@ -4,8 +4,10 @@
 優先順位: ①トグル（提出/受領） ②キーワード辞書 ③拡張子 ④90_その他
 multi/zip など要確認の判定は resolver コールバックで解決（無ければスキップ/Inbox残し）
 """
+import errno
 import os
 import shutil
+import stat
 import time
 from datetime import datetime
 
@@ -46,7 +48,33 @@ def _batch_id() -> str:
 
 def ensure_structure(base: str) -> None:
     for d in rules.all_dirs():
-        os.makedirs(os.path.join(base, d), exist_ok=True)
+        path = os.path.join(base, d)
+        try:
+            _safe_path(base, path)
+        except OSError:
+            continue  # rules.json の不正なフォルダ名（絶対パス・..）は現場の外に作らない
+        os.makedirs(path, exist_ok=True)
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def is_protected(base: str, path: str) -> bool:
+    """現場フォルダそのもの・その親・構成フォルダ（00_Inbox 等）か。
+
+    これらをドロップで移動すると現場のフォルダ構成が崩れるため扱わない。
+    """
+    p = os.path.normcase(os.path.abspath(path))
+    b = os.path.normcase(os.path.abspath(base))
+    if p == b or b.startswith(p.rstrip(os.sep) + os.sep):
+        return True
+    for d in rules.all_dirs():
+        parts = d.replace("\\", "/").split("/")
+        for i in range(1, len(parts) + 1):
+            if p == os.path.normcase(os.path.abspath(os.path.join(base, *parts[:i]))):
+                return True
+    return False
 
 
 def scan_inbox(base: str) -> list:
@@ -70,8 +98,46 @@ def is_locked(path: str) -> bool:
         with open(path, "r+b"):
             pass
     except OSError:
+        if _is_readonly(path):
+            # 読み取り専用属性のファイル（CD・受領データ等）は書き込みで開けないだけ。
+            # 読み込みで開けるなら使用中ではない（移動自体は可能）
+            try:
+                with open(path, "rb"):
+                    pass
+                return False
+            except OSError:
+                return True
         return True
     return False
+
+
+def _is_readonly(path: str) -> bool:
+    try:
+        return not (os.stat(path).st_mode & stat.S_IWRITE)
+    except OSError:
+        return False
+
+
+def _remove_file(path: str) -> None:
+    """ファイル削除（Windows の読み取り専用属性は外してから消す）"""
+    try:
+        os.remove(path)
+    except PermissionError:
+        if not _is_readonly(path):
+            raise
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        os.remove(path)
+
+
+def _rmtree(path: str) -> None:
+    """フォルダ削除（読み取り専用ファイルを含んでいても消す）"""
+    def _retry(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        func(p)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:
+        shutil.rmtree(path, onerror=_retry)
 
 
 def get_photo_date(path: str, log_cb=None) -> str:
@@ -216,7 +282,7 @@ def _chunk_copy(src, dst, progress_cb=None):
     """
     stat_before = os.stat(src)
     total = stat_before.st_size
-    tmp = dst + ".part"
+    tmp = unique_path(dst + ".part")  # 同名の .part が既にあっても上書きしない
     copied = 0
     try:
         with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
@@ -254,7 +320,14 @@ def copy_file(src, dst, progress_cb=None):
 
 
 def move_file(src, dst, progress_cb=None):
-    """移動。同一ドライブはrename、異ドライブはチャンクコピー＋元削除。"""
+    """移動。同一ドライブはrename、異ドライブはチャンクコピー＋元削除。
+
+    移動先が元と同じ場所なら何もせず src を返す（同名リネームを作らない）。
+    コピー後に元を消せない（使用中など）場合は、コピーを消してから例外を出す
+    （元と移動先の両方にファイルが残り、履歴にも載らない状態を作らない）。
+    """
+    if _same_path(src, dst):
+        return src
     dst = unique_path(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     total = os.path.getsize(src)
@@ -266,16 +339,52 @@ def move_file(src, dst, progress_cb=None):
     except OSError:
         pass
     _chunk_copy(src, dst, progress_cb)
-    os.remove(src)
+    try:
+        _remove_file(src)
+    except OSError:
+        _remove_file(dst)
+        raise
     return dst
 
 
-def move_dir(src, dst_dir):
-    """フォルダを丸ごと移動（衝突時はフォルダ名にタイムスタンプ付与）"""
-    dst = unique_path(os.path.join(dst_dir, os.path.basename(src)))
-    os.makedirs(dst_dir, exist_ok=True)
-    shutil.move(src, dst)
+def move_tree(src, dst, log_cb=None):
+    """フォルダを dst（存在しないパス）へ移動。
+
+    同一ドライブは rename（失敗したらそのまま例外）。別ドライブはコピー → 元を削除。コピーに失敗したら
+    途中までのコピーを消して例外（元はそのまま）。コピー完了後に元の一部を
+    消せなかった場合は、全データが dst にあるので移動成功として扱い、ログで知らせる。
+    """
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+        return dst
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            # 別ドライブ以外の失敗（中のファイルが使用中・権限など）はコピーに切り替えない。
+            # 全部コピーしてから元を一部しか消せない、という中途半端な状態を作らないため
+            raise
+    try:
+        shutil.copytree(src, dst, symlinks=True)
+    except BaseException:
+        if os.path.exists(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        raise
+    try:
+        _rmtree(src)
+    except OSError as e:
+        if log_cb:
+            log_cb("[注意] %s: 移動先へのコピーは完了しましたが、元フォルダの一部を"
+                   "削除できませんでした（使用中のファイルがある可能性）: %s"
+                   % (os.path.basename(src), e))
     return dst
+
+
+def move_dir(src, dst_dir, log_cb=None):
+    """フォルダを丸ごと dst_dir 直下へ移動（衝突時はフォルダ名にタイムスタンプ付与）"""
+    dst = os.path.join(dst_dir, os.path.basename(src))
+    if _same_path(src, dst):
+        return src
+    return move_tree(src, unique_path(dst), log_cb)
 
 
 def _dest_for(base, src, folder, photo, log_cb=None):
@@ -411,8 +520,13 @@ def ingest_drop(base, paths, toggle=None,
                 if log_cb:
                     log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
                 continue
+            if is_protected(base, src):
+                if log_cb:
+                    log_cb("[スキップ] %s: 現場フォルダ・構成フォルダは移動できません" % name)
+                continue
             if os.path.isdir(src):
-                ops += _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo)
+                ops += _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo,
+                                   skipped)
                 continue
             if not os.path.isfile(src):
                 continue
@@ -447,7 +561,11 @@ def ingest_drop(base, paths, toggle=None,
                 else:
                     work = os.path.join(base, rules.WORK_DIR, name)
                     a1 = copy_file(src, work)
-                    a2 = copy_file(src, sub)
+                    try:
+                        a2 = copy_file(src, sub)
+                    except BaseException:
+                        _remove_file(a1)  # 片方だけのコピーを履歴に載らないまま残さない
+                        raise
                     ops.append({"op": "copy_dual", "src": src, "dst": a1,
                                 "dst2": a2, "time": _now(), "batch": batch})
                     if log_cb:
@@ -473,7 +591,12 @@ def ingest_drop(base, paths, toggle=None,
         except (OSError, IOError) as e:
             if log_cb:
                 log_cb("[スキップ] %s: %s" % (name, e))
-    return ops
+    return _drop_noop(ops)
+
+
+def _drop_noop(ops):
+    """既に移動先にあった（移動しなかった）操作を除く（Undo・件数に載せない）"""
+    return [o for o in ops if not (o["op"] == "move" and _same_path(o["src"], o["dst"]))]
 
 
 def summarize_ops(base, ops):
@@ -493,13 +616,13 @@ def summarize_ops(base, ops):
     return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
-def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
+def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo, skipped=None):
     """フォルダ投入時の処理"""
     name = os.path.basename(src)
     ops = []
     if toggle == "receive":
         # 解体せず12直下へ丸ごと
-        actual = move_dir(src, os.path.join(base, rules.RECEIVE_DIR))
+        actual = move_dir(src, os.path.join(base, rules.RECEIVE_DIR), log_cb)
         ops.append({"op": "move", "src": src, "dst": actual,
                     "time": _now(), "batch": batch})
         if log_cb:
@@ -517,7 +640,7 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
         return ops
     if choice == "others":
         # 解体せず 90_その他 へ丸ごと（仕分け不要のフォルダ用）
-        actual = move_dir(src, os.path.join(base, rules.OTHERS))
+        actual = move_dir(src, os.path.join(base, rules.OTHERS), log_cb)
         ops.append({"op": "move", "src": src, "dst": actual,
                     "time": _now(), "batch": batch})
         if log_cb:
@@ -528,11 +651,26 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
             p = os.path.join(src, item)
             # 1件の失敗で残りの処理と移動済み分の履歴を失わないよう個別に捕捉
             try:
+                if os.path.islink(p):
+                    if log_cb:
+                        log_cb("[スキップ] %s: シンボリックリンクは処理できません" % item)
+                    continue
+                if is_protected(base, p):
+                    continue
                 if os.path.isdir(p):
-                    actual = move_dir(p, os.path.join(base, rules.INBOX))
+                    actual = move_dir(p, os.path.join(base, rules.INBOX), log_cb)
                     ops.append({"op": "move", "src": p, "dst": actual,
                                 "time": _now(), "batch": batch})
                 else:
+                    if is_transient(item):
+                        continue  # ロック・一時ファイルは元フォルダに残す
+                    if is_locked(p):
+                        if log_cb:
+                            log_cb("[スキップ] %s: 使用中" % item)
+                        if skipped is not None:
+                            skipped.append({"path": p, "toggle": toggle,
+                                            "reason": "使用中"})
+                        continue
                     folder = _resolve(p, resolver, log_cb)
                     if not folder:
                         folder = rules.INBOX
@@ -552,7 +690,7 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
         except OSError:
             pass
     else:
-        actual = move_dir(src, os.path.join(base, rules.INBOX))
+        actual = move_dir(src, os.path.join(base, rules.INBOX), log_cb)
         ops.append({"op": "move", "src": src, "dst": actual,
                     "time": _now(), "batch": batch})
         if log_cb:
@@ -562,6 +700,10 @@ def _ingest_dir(base, src, toggle, batch, resolver, log_cb, photo):
 
 def create_site(parent_dir, name, templates=None, log_cb=None):
     """新規現場のテンプレート一発作成（フォルダ構造＋雛形ファイル配置）"""
+    name = (name or "").strip()
+    if (not name or name in (".", "..") or "/" in name or "\\" in name
+            or any(c in name for c in '<>:"|?*')):
+        raise ValueError("現場名に使えない文字が含まれています: %s" % name)
     base = os.path.join(parent_dir, name)
     if os.path.exists(base):
         raise ValueError("既に存在します: %s" % base)
@@ -574,8 +716,14 @@ def create_site(parent_dir, name, templates=None, log_cb=None):
                 log_cb("[雛形スキップ] 見つかりません: %s" % src)
             continue
         dst_dir = os.path.join(base, dst_rel)
-        os.makedirs(dst_dir, exist_ok=True)
-        shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+        try:
+            _safe_path(base, dst_dir)
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(src, os.path.join(dst_dir, os.path.basename(src)))
+        except OSError as e:
+            if log_cb:
+                log_cb("[雛形スキップ] %s: %s" % (os.path.basename(src), e))
+            continue
         if log_cb:
             log_cb("[雛形配置] %s → %s" % (os.path.basename(src), dst_rel or "（直下）"))
     return base
@@ -602,21 +750,36 @@ def archive_files(base, paths, log_cb=None):
 
 
 def send_to_inbox(base, paths, log_cb=None):
-    """仮置き: ファイル/フォルダを 00_Inbox へ移動（仕分けしない）"""
+    """仮置き: ファイル/フォルダを 00_Inbox へ移動（仕分けしない）
+
+    戻り値: 操作リスト（Undo用）
+    """
     ensure_structure(base)
     inbox = os.path.join(base, rules.INBOX)
-    moved = []
+    batch = _batch_id()
+    ops = []
     for src in paths:
+        name = os.path.basename(src)
         try:
+            if os.path.islink(src):
+                if log_cb:
+                    log_cb("[スキップ] %s: シンボリックリンクは処理できません" % name)
+                continue
+            if is_protected(base, src):
+                if log_cb:
+                    log_cb("[スキップ] %s: 現場フォルダ・構成フォルダは移動できません" % name)
+                continue
             if os.path.isdir(src):
-                moved.append(move_dir(src, inbox))
+                actual = move_dir(src, inbox, log_cb)
             elif os.path.isfile(src):
-                moved.append(move_file(src, os.path.join(inbox, os.path.basename(src))))
+                actual = move_file(src, os.path.join(inbox, name))
             else:
                 continue
+            ops.append({"op": "move", "src": src, "dst": actual,
+                        "time": _now(), "batch": batch})
             if log_cb:
-                log_cb("Inboxへ仮置き: %s" % os.path.basename(src))
+                log_cb("Inboxへ仮置き: %s" % name)
         except (OSError, IOError) as e:
             if log_cb:
-                log_cb("[転送失敗] %s: %s" % (os.path.basename(src), e))
-    return moved
+                log_cb("[転送失敗] %s: %s" % (name, e))
+    return _drop_noop(ops)
