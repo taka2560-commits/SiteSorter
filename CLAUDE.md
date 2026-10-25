@@ -25,6 +25,7 @@ venv\Scripts\pythonw.exe main.py
 python test_core.py       # コアエンジンテスト（分類・履歴・アンドゥ・EXIF）
 python test_phase_d.py    # Phase D 機能テスト
 python test_phase_e.py    # Phase E 機能テスト
+python test_ui.py         # 画面まわり（起動・ドロップゾーン・二重起動・エラー記録）。画面なし環境は QT_QPA_PLATFORM=offscreen
 ```
 
 **EXE ビルド:**
@@ -113,6 +114,12 @@ JSON 読み込みの最大ファイルサイズ: **10 MB**（メモリ枯渇防�
 - ファイル操作前にシンボリックリンクを拒否
 - 書き込み中ファイルはダブルスタット（0.5秒間隔）で検出してスキップ。待機は呼び出しごとに1回（`_writing_set()`）で、ファイルごとに待たない（ドロップ処理はGUIスレッドで動くため、ファイル数に比例して画面が固まる）。ドロップゾーンでは `sleep` せず、`drop_snapshot()` → `QTimer` で0.5秒後に `ingest_drop(..., snapshot=)` を呼ぶ（GUIスレッドで待つとエクスプローラのドラッグ操作が終われず、ドラッグ画像が画面に残る）。ドロップ経路では作成・更新から `QUIET_SECONDS`（2秒）以上経ったファイルは待機を省く（コピー途中のファイルは作成・更新日時が新しいので必ず待機付きチェックに回る。使用中は `is_locked()` で検出）
 - ロックファイルは捕捉して `retry_dialog.py` に渡す
+- 現場フォルダそのもの・その親・構成フォルダ（`rules.all_dirs()`）は `is_protected()` でドロップ・仮置きの対象外（移動すると現場の構成が崩れる）
+- ルールのフォルダ名は `rules.valid_folder_name()` で現場内の相対パスに限る（絶対パス・`..` 不可）。`ensure_structure()` も現場外には作らない
+- 移動は失敗時に中途半端な状態を残さない: 別ドライブ移動で元を消せなければコピーを消す（`move_file`）、フォルダのコピー失敗時は途中のコピーを消す（`move_tree`）、提出の2箇所目のコピー失敗時は1箇所目を消す
+- 元に戻せなかった操作（使用中など）は履歴に残して再試行可能にする。移動先が消えている操作だけ履歴から外す（`History._undo_ops`）
+- settings.json / rules.json / history.json は `config.write_json_atomic()`（一時ファイル → 置き換え）で保存する。読めなかった settings.json は `.broken` に退避
+- 二重起動は `QLockFile`（`%APPDATA%\SiteSorter\SiteSorter.lock`）で防ぐ。想定外の例外は `error.log` とログ画面に出す（EXE はコンソールが無い）
 - 仕分けループ内の失敗はファイル単位で捕捉し、移動済み分の操作（Undo用）を失わない。`SortWorker` は例外時も `finished_batch` を必ず送る
 
 ### テストの規約

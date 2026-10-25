@@ -13,8 +13,9 @@ from PySide6.QtWidgets import (
 import rules
 from config import HISTORY_PATH, save_settings
 from core.history import History
-from core.organizer import (archive_files, create_site, ensure_structure,
-                            ingest_drop, preflight, scan_inbox, send_to_inbox)
+from core.organizer import (_size_or_zero, archive_files, create_site,
+                            ensure_structure, ingest_drop, preflight,
+                            scan_inbox, send_to_inbox)
 from core.worker import CapacityWorker, SortWorker
 from ui import dialogs, theme
 from ui.archive_dialog import ArchiveDialog
@@ -373,7 +374,10 @@ class MainWindow(QMainWindow):
             self._fill_rules_table()
             base = self.settings.get("site_folder")
             if base and os.path.isdir(base):
-                ensure_structure(base)
+                try:
+                    ensure_structure(base)
+                except OSError as e:
+                    self.log(f"[注意] 新しいフォルダを作れませんでした: {e}")
             self.log("仕分けルールを更新しました (rules.json)")
             self.refresh_inbox()
 
@@ -386,7 +390,12 @@ class MainWindow(QMainWindow):
         base = self.settings.get("site_folder")
         if not base:
             return
-        send_to_inbox(base, paths, log_cb=self.log)
+        try:
+            ops = send_to_inbox(base, paths, log_cb=self.log)
+        except OSError as e:
+            self.log(f"[エラー] Inboxへの仮置きに失敗しました: {e}")
+            return
+        self.history.record(ops)
         self.refresh_inbox()
 
     # ---------- 容量モニター ----------
@@ -469,8 +478,8 @@ class MainWindow(QMainWindow):
             base = create_site(parent, name.strip(),
                                self.settings.get("templates", []),
                                log_cb=self.log)
-        except ValueError as e:
-            QMessageBox.warning(self, "SiteSorter", str(e))
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, "SiteSorter", f"現場を作成できませんでした:\n{e}")
             return
         self.log(f"新規現場を作成しました: {base}")
         self.switch_site(base)
@@ -561,8 +570,14 @@ class MainWindow(QMainWindow):
         if save:
             save_settings(self.settings)
         if os.path.isdir(path):
-            ensure_structure(path)
-            self.log(f"対象フォルダ: {path}")
+            try:
+                ensure_structure(path)
+                self.log(f"対象フォルダ: {path}")
+            except OSError as e:
+                self.log(f"[注意] 現場フォルダに構成フォルダを作れません"
+                         f"（書き込み権限・空き容量を確認してください）: {e}")
+        else:
+            self.log(f"[注意] 現場フォルダが見つかりません（ドライブ未接続・移動済み？）: {path}")
         if self.zone:
             self.zone.set_site(os.path.basename(path))
         self.refresh_inbox()
@@ -581,17 +596,22 @@ class MainWindow(QMainWindow):
             self._update_buttons()
             return
         inbox = os.path.join(base, rules.INBOX)
-        dirs = []
-        if os.path.isdir(inbox):
+        try:
             dirs = sorted(d for d in os.listdir(inbox)
-                          if os.path.isdir(os.path.join(inbox, d)))
-        files = scan_inbox(base)
-        total = sum(os.path.getsize(f) for f in files)
+                          if os.path.isdir(os.path.join(inbox, d))) \
+                if os.path.isdir(inbox) else []
+            files = scan_inbox(base)
+        except OSError as e:
+            self.inbox_label.setText(f"00_Inbox を読み込めません: {e}")
+            self._update_buttons()
+            return
+        sizes = {f: _size_or_zero(f) for f in files}  # 一覧中に移動・削除されても落ちない
+        total = sum(sizes.values())
         for d in dirs:
             self.inbox_list.addItem(f"📁 {d}/")
         for f in files:
             self.inbox_list.addItem(
-                f"{os.path.basename(f)}  ({fmt_size(os.path.getsize(f))})")
+                f"{os.path.basename(f)}  ({fmt_size(sizes[f])})")
         self.inbox_label.setText(
             f"00_Inbox 待機: <b style='color:{COLORS['accent']}'>"
             f"{len(files)}件</b>"
@@ -616,7 +636,11 @@ class MainWindow(QMainWindow):
         if not base or not os.path.isdir(base):
             QMessageBox.warning(self, "SiteSorter", "現場フォルダを指定してください。")
             return
-        files = scan_inbox(base)
+        try:
+            files = scan_inbox(base)
+        except OSError as e:
+            QMessageBox.warning(self, "SiteSorter", f"00_Inbox を読み込めません:\n{e}")
+            return
         if not files:
             self.log("00_Inbox にファイルがありません。")
             return
@@ -661,6 +685,13 @@ class MainWindow(QMainWindow):
         self.refresh_inbox()
         if self.stack.currentIndex() == 1:
             self._refresh_history_list()
+
+    def wait_for_worker(self):
+        """アプリ終了時: 一括仕分けの途中で止めるとファイルが移動途中になるため完了を待つ"""
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait()
+        if self.cap_worker is not None and self.cap_worker.isRunning():
+            self.cap_worker.wait()
 
     def closeEvent(self, e):
         e.ignore()

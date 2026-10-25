@@ -16,7 +16,7 @@ os.environ["HOME"] = DATA_TMP     # Linux（~/.config）
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules
-from core.organizer import ensure_structure, organize, ingest_drop, scan_inbox, send_to_inbox
+from core.organizer import ensure_structure, organize, ingest_drop
 from core.history import History
 
 if not rules.RULES_PATH.startswith(DATA_TMP):
@@ -386,6 +386,303 @@ hO = History(os.path.join(base10, "hO.json")); hO.record(opsO)
 check("元に戻すと元の場所へ戻る",
       hO.undo_batch(opsO[0]["batch"]) == 1 and os.path.exists(os.path.join(dO, "sub", "b.txt")))
 shutil.rmtree(base10); shutil.rmtree(os.path.dirname(dO))
+
+import errno
+import stat
+import config
+import core.organizer as org
+from core.organizer import is_protected, move_file, move_tree
+from core.versions import find_old_candidates
+
+class _CrossDevice:
+    """os.rename を失敗させ、別ドライブ間の移動（コピー＋元削除）を再現する"""
+    def __enter__(self):
+        self.real = os.rename
+        def fail(a, b):
+            raise OSError(errno.EXDEV, "別ドライブ（テスト）")
+        os.rename = fail
+    def __exit__(self, *a):
+        os.rename = self.real
+
+print("[24] 読み取り専用ファイルを「使用中」と誤判定しない")
+d24 = tempfile.mkdtemp(prefix="ro_")
+ro = put(d24, "受領図.dwg")
+os.chmod(ro, stat.S_IREAD)
+real_open = open
+def _ro_open(path, mode="r", *a, **k):  # 読み取り専用ファイルは書き込みで開けない（Windowsの挙動）
+    if path == ro and "+" in mode:
+        raise PermissionError(13, "読み取り専用")
+    return real_open(path, mode, *a, **k)
+org.open = _ro_open
+try:
+    check("読み取り専用は使用中ではない", not org.is_locked(ro))
+finally:
+    del org.open
+base24 = tempfile.mkdtemp(prefix="v2ro_")
+with _CrossDevice():
+    ops24 = ingest_drop(base24, [ro])
+check("読み取り専用ファイルも別ドライブから移動できる",
+      len(ops24) == 1 and not os.path.exists(ro)
+      and os.path.exists(os.path.join(base24, rules.WORK_DIR, "受領図.dwg")))
+src24 = put(d24, "提出図.dwg"); os.chmod(src24, stat.S_IREAD)
+ops24b = ingest_drop(base24, [src24], toggle="submit")
+h24 = History(os.path.join(base24, "h.json")); h24.record(ops24b)
+check("読み取り専用のコピーも元に戻す（削除）できる",
+      h24.undo_last() == 1 and not os.path.exists(ops24b[0]["dst"])
+      and not os.path.exists(ops24b[0]["dst2"]))
+
+print("[25] 別ドライブ移動で元を消せないとき、移動先にコピーを残さない")
+base25 = tempfile.mkdtemp(prefix="v2rm_")
+src25 = put(tempfile.mkdtemp(), "使用中.dwg")
+real_remove = os.remove
+def _no_remove(path):
+    if path == src25:
+        raise PermissionError(13, "使用中（テスト）")
+    return real_remove(path)
+os.remove = _no_remove
+try:
+    with _CrossDevice():
+        logs25 = []
+        ops25 = ingest_drop(base25, [src25], log_cb=logs25.append)
+finally:
+    os.remove = real_remove
+check("元は残り、移動先には無く、記録もしない",
+      os.path.exists(src25) and not ops25
+      and not os.path.exists(os.path.join(base25, rules.WORK_DIR, "使用中.dwg")))
+check("失敗理由がログに出る", any("使用中.dwg" in l for l in logs25))
+
+print("[26] 現場フォルダ・構成フォルダはドロップしても移動しない")
+base26 = tempfile.mkdtemp(prefix="v2pr_")
+ensure_structure(base26)
+put(os.path.join(base26, rules.WORK_DIR), "a.dwg")
+logs26 = []
+ops26 = ingest_drop(base26, [os.path.join(base26, rules.WORK_DIR)],
+                    resolver=lambda k, n, c: "others", log_cb=logs26.append)
+check("10_図面_作業用 を丸ごと90へ → 移動しない",
+      not ops26 and os.path.exists(os.path.join(base26, rules.WORK_DIR, "a.dwg")))
+ops26b = ingest_drop(base26, [base26], resolver=lambda k, n, c: "expand")
+check("現場フォルダそのものを個別仕分け → 何も動かさない",
+      not ops26b and os.listdir(os.path.join(base26, rules.INBOX)) == [])
+check("現場の親フォルダ・入れ子の構成フォルダも保護",
+      is_protected(base26, os.path.dirname(base26))
+      and is_protected(base26, os.path.join(base26, "21_3Dスキャン"))
+      and is_protected(base26, os.path.join(base26, "21_3Dスキャン", "03_エクスポート点群")))
+inbox_file = put(os.path.join(base26, rules.INBOX), "座標.sim")
+check("Inbox内のファイル・フォルダは通常どおり扱える",
+      not is_protected(base26, inbox_file)
+      and len(ingest_drop(base26, [inbox_file])) == 1)
+check("Inbox仮置き（メイン画面）でも構成フォルダは移動しない",
+      org.send_to_inbox(base26, [os.path.join(base26, rules.OTHERS)]) == []
+      and os.path.isdir(os.path.join(base26, rules.OTHERS)))
+
+print("[27] 別ドライブのフォルダ移動とその「元に戻す」")
+base27 = tempfile.mkdtemp(prefix="v2xd_")
+d27 = os.path.join(tempfile.mkdtemp(), "受領一式")
+put(d27, "a.dwg"); put(os.path.join(d27, "sub"), "b.txt")
+with _CrossDevice():
+    ops27 = ingest_drop(base27, [d27], resolver=lambda k, n, c: "keep")
+    moved27 = os.path.join(base27, rules.INBOX, "受領一式")
+    check("フォルダごとコピーされ、元は消える",
+          len(ops27) == 1 and not os.path.exists(d27)
+          and os.path.exists(os.path.join(moved27, "sub", "b.txt")))
+    h27 = History(os.path.join(base27, "h.json")); h27.record(ops27)
+    check("元に戻すと元の場所へ戻る（別ドライブでも）",
+          h27.undo_last() == 1 and os.path.exists(os.path.join(d27, "sub", "b.txt"))
+          and not os.path.exists(moved27))
+d27b = os.path.join(tempfile.mkdtemp(), "途中失敗")
+put(d27b, "a.dwg")
+real_copytree = shutil.copytree
+def _half_copytree(src, dst, **kw):
+    os.makedirs(dst); open(os.path.join(dst, "途中.tmp"), "w").close()
+    raise OSError(28, "空き容量不足（テスト）")
+shutil.copytree = _half_copytree
+try:
+    with _CrossDevice():
+        move_tree(d27b, os.path.join(base27, "dst"))
+except OSError:
+    pass
+finally:
+    shutil.copytree = real_copytree
+check("フォルダのコピーに失敗したら途中のコピーを消し、元はそのまま",
+      not os.path.exists(os.path.join(base27, "dst")) and os.path.exists(os.path.join(d27b, "a.dwg")))
+real_rename27 = os.rename
+def _in_use(a, b):
+    raise PermissionError(13, "中のファイルが使用中（テスト）")
+os.rename = _in_use
+try:
+    move_tree(d27b, os.path.join(base27, "dst2"))
+    raised27 = False
+except OSError:
+    raised27 = True
+finally:
+    os.rename = real_rename27
+check("同じドライブで移動できないときはコピーに切り替えない（中途半端に消さない）",
+      raised27 and not os.path.exists(os.path.join(base27, "dst2"))
+      and os.path.exists(os.path.join(d27b, "a.dwg")))
+
+print("[28] 使用中で元に戻せなかった操作は履歴に残し、後で再試行できる")
+base28 = tempfile.mkdtemp(prefix="v2uf_")
+f28 = put(tempfile.mkdtemp(), "開いている.dwg")
+ops28 = ingest_drop(base28, [f28])
+h28 = History(os.path.join(base28, "h.json")); h28.record(ops28)
+real_move = org.move_file
+def _busy(*a, **k):
+    raise PermissionError(13, "使用中（テスト）")
+org.move_file = _busy
+try:
+    logs28 = []
+    n28 = h28.undo_last(log_cb=logs28.append)
+finally:
+    org.move_file = real_move
+check("1回目は失敗し、履歴に残る", n28 == 0 and len(h28.recent()) == 1
+      and any("Undo失敗" in l for l in logs28))
+check("閉じた後の再試行で戻せる", h28.undo_last() == 1 and os.path.exists(f28)
+      and h28.recent() == [])
+h28.record([{"op": "move", "src": f28 + ".x", "dst": f28 + ".消えた", "batch": "b"}])
+check("移動先が消えている操作は履歴から外す（再試行しても戻せない）",
+      h28.undo_last() == 0 and h28.recent() == [])
+f28b = put(tempfile.mkdtemp(), "USBから.dwg")
+ops28b = ingest_drop(base28, [f28b])
+h28.record(ops28b)
+usb28 = os.path.dirname(f28b)
+shutil.rmtree(usb28)  # 元のドライブが外れている状態
+real_makedirs = os.makedirs
+def _no_drive(path, *a, **k):
+    if path.startswith(usb28):
+        raise FileNotFoundError(2, "ドライブが見つかりません（テスト）")
+    return real_makedirs(path, *a, **k)
+os.makedirs = _no_drive
+try:
+    n28b = h28.undo_last()
+finally:
+    os.makedirs = real_makedirs
+check("元のドライブが未接続で戻せないときは履歴に残す（つないでから再試行できる）",
+      n28b == 0 and len(h28.recent()) == 1)
+check("ドライブをつないだ後の再試行で戻せる", h28.undo_last() == 1 and os.path.exists(f28b))
+
+print("[29] 既に移動先にあるファイルは名前を変えない")
+base29 = tempfile.mkdtemp(prefix="v2sp_")
+ensure_structure(base29)
+z29 = put(os.path.join(base29, rules.INBOX), "納品.zip")
+ops29 = ingest_drop(base29, [z29], resolver=lambda k, n, c: None)
+check("Inboxのzipを移動先未確定のまま → そのまま・記録なし",
+      os.listdir(os.path.join(base29, rules.INBOX)) == ["納品.zip"] and not ops29)
+w29 = put(os.path.join(base29, rules.WORK_DIR), "断面.dxf")
+ops29b = ingest_drop(base29, [w29])
+check("仕分け済みファイルを再ドロップ → そのまま・記録なし",
+      os.listdir(os.path.join(base29, rules.WORK_DIR)) == ["断面.dxf"] and not ops29b)
+check("move_file は同じ場所なら何もしない", move_file(w29, w29) == w29 and os.path.exists(w29))
+
+print("[30] ルールのフォルダ名は現場フォルダ内に限る")
+check("使えるフォルダ名", all(rules.valid_folder_name(n) for n in
+      ("10_図面", "21_3Dスキャン/03_エクスポート点群", "21_3Dスキャン\\02_プロジェクト")))
+check("使えないフォルダ名", not any(rules.valid_folder_name(n) for n in
+      ("", " ", "/etc", "\\\\server\\share", "C:\\Windows", "C:x", "..", "a/../..",
+       "a//b", "a/./b", "名前?", "x|y")))
+saved30 = json.loads(json.dumps({"folders": {k: sorted(v) for k, v in rules.FOLDERS.items()},
+                                  "keywords": rules.KEYWORDS}))
+outside30 = os.path.join(tempfile.mkdtemp(), "現場の外")
+rules._apply({"folders": {outside30: [".abc"], "../外": [".def"], "40_報告書・書類": [".xlsx"]},
+              "keywords": {"40_報告書・書類": "報告書"}})
+check("不正なフォルダ名のルールは読み込まない", list(rules.FOLDERS) == ["40_報告書・書類"])
+check("キーワードが文字列1つでも1語として扱う（1文字ずつにしない）",
+      rules.KEYWORDS["40_報告書・書類"] == ["報告書"])
+base30 = tempfile.mkdtemp(prefix="v2rn_")
+rules.FOLDERS[outside30] = {".abc"}  # 万一読み込まれても
+ensure_structure(base30)
+check("現場の外にフォルダを作らない", not os.path.exists(outside30))
+rules._apply(saved30)
+
+print("[31] 設定ファイルの破損・不正形式で起動が止まらない")
+open(config.SETTINGS_PATH, "w").write("[1, 2]")
+import warnings as _w
+with _w.catch_warnings(record=True) as cw:
+    _w.simplefilter("always")
+    st31 = config.load_settings()
+check("配列形式 → 既定値で起動し警告を出す", st31["theme"] == "earth" and cw)
+check("壊れたファイルは .broken に退避", os.path.exists(config.SETTINGS_PATH + ".broken"))
+config.save_settings({"theme": "night"})
+check("保存は一時ファイル経由（.tmp が残らない）",
+      json.load(open(config.SETTINGS_PATH, encoding="utf-8")) == {"theme": "night"}
+      and not os.path.exists(config.SETTINGS_PATH + ".tmp"))
+os.remove(config.SETTINGS_PATH); os.remove(config.SETTINGS_PATH + ".broken")
+
+print("[32] 提出の同時コピーで2箇所目に失敗 → 1箇所目のコピーも残さない")
+base32 = tempfile.mkdtemp(prefix="v2cd_")
+s32 = put(tempfile.mkdtemp(), "提出図.dwg")
+real_copy = org.copy_file
+calls32 = []
+def _second_fails(a, b, cb=None):
+    calls32.append(b)
+    if len(calls32) == 2:
+        raise OSError(28, "空き容量不足（テスト）")
+    return real_copy(a, b, cb)
+org.copy_file = _second_fails
+try:
+    ops32 = ingest_drop(base32, [s32], toggle="submit")
+finally:
+    org.copy_file = real_copy
+check("記録なし・10にコピーが残らない・元は残る",
+      not ops32 and os.listdir(os.path.join(base32, rules.WORK_DIR)) == [] and os.path.exists(s32))
+
+print("[33] フォルダの個別仕分けでも使用中・一時ファイル・リンクは動かさない")
+base33 = tempfile.mkdtemp(prefix="v2ex_")
+d33 = os.path.join(tempfile.mkdtemp(), "作業中フォルダ")
+put(d33, "編集中.dwg"); put(d33, "編集中.dwl"); put(d33, "~$見積.xlsx"); put(d33, "座標.sim")
+if hasattr(os, "symlink"):
+    try:
+        os.symlink(os.path.join(d33, "座標.sim"), os.path.join(d33, "リンク.sim"))
+    except OSError:
+        pass
+sk33 = []
+ops33 = ingest_drop(base33, [d33], resolver=lambda k, n, c: "expand", skipped=sk33)
+left33 = sorted(os.listdir(d33))
+check("使用中(.dwl有り)・ロック・一時ファイルは元フォルダに残る",
+      {"編集中.dwg", "編集中.dwl", "~$見積.xlsx"} <= set(left33))
+check("使用中は再試行リストへ", [os.path.basename(x["path"]) for x in sk33] == ["編集中.dwg"])
+check("通常のファイルは仕分けられる",
+      os.path.exists(os.path.join(base33, "20_測量データ", "座標.sim"))
+      and [os.path.basename(o["src"]) for o in ops33] == ["座標.sim"])
+
+print("[34] Inbox仮置き（メイン画面）も元に戻せる")
+base34 = tempfile.mkdtemp(prefix="v2ib_")
+f34 = put(tempfile.mkdtemp(), "仮置き.pdf")
+ops34 = org.send_to_inbox(base34, [f34])
+h34 = History(os.path.join(base34, "h.json")); h34.record(ops34)
+check("仮置きの操作を返し、元に戻せる",
+      len(ops34) == 1 and h34.undo_last() == 1 and os.path.exists(f34))
+
+print("[35] 旧版検知は写真・3Dスキャンを対象にしない")
+base35 = tempfile.mkdtemp(prefix="v2ov_")
+ensure_structure(base35)
+put(os.path.join(base35, "30_現場写真", "2026-06-01"), "現場 (1).jpg")
+put(os.path.join(base35, "30_現場写真", "2026-06-01"), "現場 (2).jpg")
+put(os.path.join(base35, "21_3Dスキャン", "01_RAWデータ_FLS"), "Scan_20260601.fls")
+put(os.path.join(base35, "21_3Dスキャン", "01_RAWデータ_FLS"), "Scan_20260602.fls")
+put(os.path.join(base35, rules.WORK_DIR), "縦断図_v1.dwg")
+put(os.path.join(base35, rules.WORK_DIR), "縦断図_v2.dwg")
+c35 = [c["rel"] for c in find_old_candidates(base35)]
+check("図面の旧版だけが候補", len(c35) == 1 and c35[0].startswith(rules.WORK_DIR))
+
+print("[36] 新規現場: 不正な名前・現場外への雛形配置を防ぐ")
+parent36 = tempfile.mkdtemp(prefix="v2ns_")
+bad36 = []
+for nm in ("..", "a/b", "a\\b", "現場:1", "  "):
+    try:
+        org.create_site(parent36, nm)
+    except ValueError:
+        bad36.append(nm)
+check("使えない現場名は作らない", len(bad36) == 5 and os.listdir(parent36) == [])
+tpl36 = put(tempfile.mkdtemp(), "雛形.xlsx")
+outside36 = os.path.join(tempfile.mkdtemp(), "外")
+logs36 = []
+b36 = org.create_site(parent36, "現場A", [{"src": tpl36, "dst": outside36},
+                                         {"src": tpl36, "dst": "40_報告書・書類"}],
+                      log_cb=logs36.append)
+check("雛形は現場内だけに置き、現場外の指定はスキップ",
+      not os.path.exists(outside36)
+      and os.path.exists(os.path.join(b36, "40_報告書・書類", "雛形.xlsx"))
+      and any("雛形スキップ" in l for l in logs36))
 
 shutil.rmtree(base); shutil.rmtree(desk)
 shutil.rmtree(DATA_TMP, ignore_errors=True)

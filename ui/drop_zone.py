@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """② クイック・インボックサー（常時最前面・高透過・提出/受領トグル付き）"""
 import os
+import sys
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
@@ -150,10 +151,13 @@ class DropZone(QWidget):
         """
         base = self.settings.get("site_folder")
         self._clear_undo()
-        if not base:
+        if not base or not os.path.isdir(base):
+            # 見つからない現場（ドライブ未接続・名前変更）に構成フォルダを作り直して
+            # そこへ仕分けてしまわないよう、処理しない
             self.setStyleSheet(self._idle)
-            self.label.setText("⚠\n現場フォルダ\n未設定")
-            self._reset_timer.start(NOTICE_MS)
+            self.label.setText("⚠\n現場フォルダ\n未設定" if not base
+                               else "⚠\n現場フォルダが\n見つかりません")
+            self._reset_timer.start(NOTICE_MS * 2)
             return
         self.label.setText("⏳\n処理中…")
         snap = drop_snapshot(paths)
@@ -165,9 +169,20 @@ class DropZone(QWidget):
     def _process(self, base: str, paths: list, toggle, snap: dict):
         resolver = dialogs.gui_resolver(self.main_window)
         sk = []
-        ops = ingest_drop(base, paths, toggle=toggle,
-                          log_cb=self.main_window.log, resolver=resolver,
-                          skipped=sk, snapshot=snap)
+        try:
+            ops = ingest_drop(base, paths, toggle=toggle,
+                              log_cb=self.main_window.log, resolver=resolver,
+                              skipped=sk, snapshot=snap)
+        except Exception as e:
+            # 現場フォルダに書き込めない等。「処理中…」のまま止めない
+            if not isinstance(e, OSError):
+                sys.excepthook(*sys.exc_info())  # 想定外のエラーは error.log へ
+            self.main_window.log(f"[エラー] ドロップを処理できませんでした: {e}")
+            self.setStyleSheet(self._idle)
+            self.label.setText("⚠\n処理できません\n（ログ参照）")
+            self.label.setToolTip(str(e))
+            self._reset_timer.start(RESULT_MS)
+            return
         self.main_window.history.record(ops)
         if sk:
             self.main_window.add_retry_items(sk)
